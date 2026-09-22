@@ -2360,6 +2360,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	function sessionAgentHasDeclaredFallbackChain(ctx: any): boolean {
 		const name =
 			process.env.SULA_DESKTOP_AGENT?.trim() ||
+			process.env.PI_HERDR_PERSONA?.trim() ||
 			process.env.PI_SUBAGENT_AGENT?.trim() ||
 			"";
 		if (!name) return false;

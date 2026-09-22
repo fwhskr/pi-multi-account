@@ -901,6 +901,100 @@ test("agent without declared fallbacks keeps global failover (stand-down is scop
 	}
 });
 
+test("producer-shaped identity: PI_HERDR_PERSONA alone stands the global chain down", async () => {
+	const accounts = {
+		"openai-codex": { type: "oauth", access: "a", refresh: "a-r", accountId: "main" },
+		"openai-codex-account-2": {
+			type: "oauth",
+			access: "other",
+			refresh: "other-r",
+			accountId: "other-account",
+		},
+	};
+	const agentsDir = join(AGENT_DIR, "agents");
+	mkdirSync(agentsDir, { recursive: true });
+	const profilePath = join(agentsDir, "halo.md");
+	writeFileSync(
+		profilePath,
+		"---\nmodel: openai-codex/gpt-6-astra\nthinking: low\nfallbacks:\n  - provider: opencode-go\n    model: deepseek-v4.1-flash\n    thinking: high\n---\n\nbody\n",
+	);
+	const prevDesktop = process.env.SULA_DESKTOP_AGENT;
+	const prevSubagent = process.env.PI_SUBAGENT_AGENT;
+	const prevHerdr = process.env.PI_HERDR_PERSONA;
+	delete process.env.SULA_DESKTOP_AGENT;
+	delete process.env.PI_SUBAGENT_AGENT;
+	process.env.PI_HERDR_PERSONA = "halo";
+	try {
+		const t = setup({
+			accounts,
+			current: { provider: "openai-codex", id: "gpt-5.5" },
+			config: { fallbacks: ["openai-codex-account-2"], autoContinue: false },
+		});
+		await finishError(t, "openai-codex", "gpt-5.5", "429 usage_limit_reached");
+		assert.deepEqual(
+			t.rec.setModels,
+			[],
+			"the launcher's identity variable alone must stand the global chain down",
+		);
+	} finally {
+		if (prevDesktop === undefined) delete process.env.SULA_DESKTOP_AGENT;
+		else process.env.SULA_DESKTOP_AGENT = prevDesktop;
+		if (prevSubagent === undefined) delete process.env.PI_SUBAGENT_AGENT;
+		else process.env.PI_SUBAGENT_AGENT = prevSubagent;
+		if (prevHerdr === undefined) delete process.env.PI_HERDR_PERSONA;
+		else process.env.PI_HERDR_PERSONA = prevHerdr;
+		rmSync(profilePath, { force: true });
+	}
+});
+
+test("identity precedence: SULA_DESKTOP_AGENT outranks PI_HERDR_PERSONA", async () => {
+	const accounts = {
+		"openai-codex": { type: "oauth", access: "a", refresh: "a-r", accountId: "main" },
+		"openai-codex-account-2": {
+			type: "oauth",
+			access: "other",
+			refresh: "other-r",
+			accountId: "other-account",
+		},
+	};
+	const agentsDir = join(AGENT_DIR, "agents");
+	mkdirSync(agentsDir, { recursive: true });
+	const plainPath = join(agentsDir, "plain.md");
+	writeFileSync(
+		plainPath,
+		"---\nmodel: openai-codex/gpt-6-astra\nthinking: low\n---\n\nbody\n",
+	);
+	const chainedPath = join(agentsDir, "chained.md");
+	writeFileSync(
+		chainedPath,
+		"---\nmodel: openai-codex/gpt-6-astra\nthinking: low\nfallbacks:\n  - provider: opencode-go\n    model: deepseek-v4.1-flash\n    thinking: high\n---\n\nbody\n",
+	);
+	const prevDesktop = process.env.SULA_DESKTOP_AGENT;
+	const prevHerdr = process.env.PI_HERDR_PERSONA;
+	process.env.SULA_DESKTOP_AGENT = "plain";
+	process.env.PI_HERDR_PERSONA = "chained";
+	try {
+		const t = setup({
+			accounts,
+			current: { provider: "openai-codex", id: "gpt-5.5" },
+			config: { fallbacks: ["openai-codex-account-2"], autoContinue: false },
+		});
+		await finishError(t, "openai-codex", "gpt-5.5", "429 usage_limit_reached");
+		assert.equal(
+			t.rec.setModels[0],
+			"openai-codex-account-2/gpt-5.5",
+			"SULA_DESKTOP_AGENT wins: 'plain' declares no chain, so the global chain proceeds",
+		);
+	} finally {
+		if (prevDesktop === undefined) delete process.env.SULA_DESKTOP_AGENT;
+		else process.env.SULA_DESKTOP_AGENT = prevDesktop;
+		if (prevHerdr === undefined) delete process.env.PI_HERDR_PERSONA;
+		else process.env.PI_HERDR_PERSONA = prevHerdr;
+		rmSync(plainPath, { force: true });
+		rmSync(chainedPath, { force: true });
+	}
+});
+
 test("session start reports deterministic duplicate account slots", async () => {
 	const accounts: Account = {
 		"openai-codex": {
