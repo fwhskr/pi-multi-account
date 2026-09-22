@@ -797,6 +797,110 @@ test("same Codex accountId in two slots is one rotation account and shares coold
 	);
 });
 
+test("declared-chain agents: global failover stands down, the profile chain owns the switch", async () => {
+	const accounts = {
+		"openai-codex": { type: "oauth", access: "a", refresh: "a-r", accountId: "main" },
+		"openai-codex-account-2": {
+			type: "oauth",
+			access: "other",
+			refresh: "other-r",
+			accountId: "other-account",
+		},
+	};
+	const agentsDir = join(AGENT_DIR, "agents");
+	mkdirSync(agentsDir, { recursive: true });
+	const profilePath = join(agentsDir, "deep.md");
+	writeFileSync(
+		profilePath,
+		[
+			"---",
+			"model: openai-codex/gpt-6-astra",
+			"thinking: low",
+			"fallbacks:",
+			"  - provider: opencode-go",
+			"    model: muse-spark-1.3-contributor",
+			"    thinking: xhigh",
+			"---",
+			"",
+			"body",
+			"",
+		].join("\n"),
+	);
+	const previousAgent = process.env.SULA_DESKTOP_AGENT;
+	process.env.SULA_DESKTOP_AGENT = "deep";
+	try {
+		const t = setup({
+			accounts,
+			current: { provider: "openai-codex", id: "gpt-5.5" },
+			config: {
+				fallbacks: ["openai-codex-account-2"],
+				autoContinue: false,
+			},
+		});
+		await finishError(t, "openai-codex", "gpt-5.5", "429 usage_limit_reached");
+		assert.deepEqual(
+			t.rec.setModels,
+			[],
+			"global failover must not switch a declared-chain session",
+			);
+		assert.deepEqual(
+			t.rec.continueCalls,
+			[],
+			"a deferred switch must not arm a continuation",
+			);
+		const state = t.readState();
+		assert.ok(
+			!state.exhaustedUntilByProvider?.["openai-codex-account-2"],
+			"a deferred switch must not poison the fallback target",
+			);
+	} finally {
+		if (previousAgent === undefined) delete process.env.SULA_DESKTOP_AGENT;
+		else process.env.SULA_DESKTOP_AGENT = previousAgent;
+		rmSync(profilePath, { force: true });
+	}
+});
+
+test("agent without declared fallbacks keeps global failover (stand-down is scoped)", async () => {
+	const accounts = {
+		"openai-codex": { type: "oauth", access: "a", refresh: "a-r", accountId: "main" },
+		"openai-codex-account-2": {
+			type: "oauth",
+			access: "other",
+			refresh: "other-r",
+			accountId: "other-account",
+		},
+	};
+	const agentsDir = join(AGENT_DIR, "agents");
+	mkdirSync(agentsDir, { recursive: true });
+	const profilePath = join(agentsDir, "deep.md");
+	writeFileSync(
+		profilePath,
+		"---\nmodel: openai-codex/gpt-6-astra\nthinking: low\n---\n\nbody\n",
+	);
+	const previousAgent = process.env.SULA_DESKTOP_AGENT;
+	process.env.SULA_DESKTOP_AGENT = "deep";
+	try {
+		const t = setup({
+			accounts,
+			current: { provider: "openai-codex", id: "gpt-5.5" },
+			config: {
+				fallbacks: ["openai-codex-account-2"],
+				autoContinue: false,
+			},
+		});
+		await finishError(t, "openai-codex", "gpt-5.5", "429 usage_limit_reached");
+		assert.equal(
+			t.rec.setModels[0],
+			"openai-codex-account-2/gpt-5.5",
+			"no declared chain in the profile => global failover proceeds",
+			);
+	} finally {
+		if (previousAgent === undefined) delete process.env.SULA_DESKTOP_AGENT;
+		else process.env.SULA_DESKTOP_AGENT = previousAgent;
+		rmSync(profilePath, { force: true });
+	}
+});
+
 test("session start reports deterministic duplicate account slots", async () => {
 	const accounts: Account = {
 		"openai-codex": {

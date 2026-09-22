@@ -2344,6 +2344,45 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		}
 	}
 
+	// Named-agent fallback-chain ownership (owner bug report 2026-09-21):
+	// when the session runs a named agent whose profile declares its OWN fallback
+	// chain, that chain (agent-fallback-chain.ts) owns model failover AND the
+	// per-fallback thinking level. Our global fallback list switching here preempts
+	// that chain (it then aborts: "active model no longer matches the failed
+	// attempt") and restoreDesiredThinking() re-asserts the STALE pre-failure
+	// level (the profile's primary thinking) over the declared per-fallback
+	// thinking. Observed live: deep (fallbacks muse-spark@xhigh, deepseek@high)
+	// landed on undeclared zai/glm-5.3-flash at profile-default low, then flapped
+	// high/max/low as the two systems fought. Mirrors
+	// extensions/lib/agent-profile-runtime.ts profileHasFallbackDeclaration
+	// (kept local so this package stays self-contained; first candidate that
+	// exists decides: fallbacks key => true, parseable frontmatter => false).
+	function sessionAgentHasDeclaredFallbackChain(ctx: any): boolean {
+		const name =
+			process.env.SULA_DESKTOP_AGENT?.trim() ||
+			process.env.PI_SUBAGENT_AGENT?.trim() ||
+			"";
+		if (!name) return false;
+		const agentDir =
+			process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
+		const candidates = [
+			join(ctx?.cwd ?? process.cwd(), ".pi", "agents", `${name}.md`),
+			join(agentDir, "agents", `${name}.md`),
+		];
+		for (const path of candidates) {
+			if (!existsSync(path)) continue;
+			let content: string;
+			try {
+				content = readFileSync(path, "utf8");
+			} catch {
+				return false;
+			}
+			if (/^fallbacks[ \t]*:/m.test(content)) return true;
+			if (/^---\r?\n[\s\S]*?\r?\n---/.test(content)) return false;
+		}
+		return false;
+	}
+
 	// ---- crash isolation (v1.12.0) ----------------------------------------
 	// This extension hooks ~12 Pi events and runs several background timers. Node
 	// terminates the whole process on an unhandled promise rejection, and a throw
@@ -3895,6 +3934,20 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		reason: string,
 		options: { armContinuation?: boolean } = {},
 	) {
+		// Declared-chain sessions: stand down completely — the agent profile's
+		// own fallback chain owns failover and per-fallback thinking here.
+		if (sessionAgentHasDeclaredFallbackChain(ctx)) {
+			const deferredFrom =
+				sourceModel?.provider && sourceModel?.id
+					? ref(sourceModel.provider, sourceModel.id)
+					: "unavailable/account";
+			logEvent("switch-deferred", {
+				from: deferredFrom,
+				reason,
+				to: "agent-profile-fallback-chain",
+			});
+			return;
+		}
 		const from =
 			sourceModel?.provider && sourceModel?.id
 				? ref(sourceModel.provider, sourceModel.id)
