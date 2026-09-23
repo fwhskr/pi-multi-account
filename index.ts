@@ -30,6 +30,7 @@ import {
 	existsSync,
 	mkdirSync,
 	readFileSync,
+	readdirSync,
 	renameSync,
 	statSync,
 	writeFileSync,
@@ -1899,10 +1900,83 @@ function lastAssistantStopReason(messages: any[]): string | undefined {
 // before_provider_request hooks run, but the second sees the request already
 // shaped (billing header present, Pi preamble already replaced) and no-ops.
 //
-// CLAUDE_CODE_VERSION must track the current Claude Code release; if it drifts
-// too far Anthropic may reject or miscount OAuth requests. Check `claude
-// --version` or https://github.com/anthropics/claude-code.
+// CLAUDE_CODE_VERSION must be the client version the RUNNING pi advertises, not a
+// frozen literal: Anthropic gates model availability on the value declared in the
+// billing header this extension injects, so a stale literal returns
+// `400 ... "Claude Code <literal> does not support this model"` (2026-09-23: the
+// literal said 2.1.172 while pi advertised 2.1.280, which broke
+// anthropic/claude-opus-5-5). `declaredClaudeCodeVersion` below derives it from the
+// host pi at load, so a pi update cannot strand it; the literal is only the fallback
+// for an unrecognized install layout, and that case warns once at session start.
+//
+// Keep this declaration in exactly this form: the weekly drift workflow
+// (.github/workflows/claude-code-version-check.yml) greps for this line.
 // ===========================================================================
+
+const CLAUDE_CODE_VERSION = "2.1.280";
+/**
+ * Root of the pi package that is running this extension. Node's install layout is
+ * `<prefix>/bin/node` with packages under `<prefix>/lib/node_modules`, which covers
+ * the pi-node prefix and an ordinary npm global prefix alike.
+ */
+function findHostPiRoot(): string | undefined {
+	const packagePath = join("@earendil-works", "pi-coding-agent");
+	const candidates = [
+		join(dirname(dirname(process.execPath)), "lib", "node_modules", packagePath),
+		// `process.argv[1]` is the launcher shim; a sibling cli-runtime.js marks its prefix.
+		...(() => {
+			const launcher = process.argv[1];
+			if (!launcher) return [];
+			const binDir = dirname(launcher);
+			return [
+				join(binDir, "..", "lib", "node_modules", packagePath),
+				join(binDir, "node_modules", packagePath),
+			];
+		})(),
+	];
+	for (const candidate of candidates) {
+		if (existsSync(join(candidate, "package.json"))) return candidate;
+	}
+	return undefined;
+}
+
+/** pi's advertised Claude Code client version, read from the host pi's own source. */
+function detectAdvertisedClaudeCodeVersion(): string | undefined {
+	const hostRoot = findHostPiRoot();
+	if (!hostRoot) return undefined;
+	const piAiRoot = join(hostRoot, "node_modules", "@earendil-works", "pi-ai");
+	const files = [join(piAiRoot, "dist", "api", "anthropic-messages.js")];
+	try {
+		// pi also ships a bundled copy whose chunk name is content-hashed.
+		const chunksDir = join(hostRoot, "dist", "bundle", "chunks");
+		for (const name of readdirSync(chunksDir)) {
+			if (/^anthropic-messages-.*\.js$/.test(name)) files.push(join(chunksDir, name));
+		}
+	} catch {
+		// Not a bundled build — the unbundled copy above is the only source.
+	}
+	for (const file of files) {
+		try {
+			const found = /claudeCodeVersion\s*=\s*"([0-9.]+)"/.exec(
+				readFileSync(file, "utf8"),
+			);
+			if (found) return found[1];
+		} catch {
+			// Try the next candidate.
+		}
+	}
+	return undefined;
+}
+
+const HOST_CLAUDE_CODE_VERSION = detectAdvertisedClaudeCodeVersion();
+
+/**
+ * Client version declared in the Anthropic billing header: whatever the running pi
+ * advertises, falling back to the literal above. Exported so tests bind to the live
+ * value instead of a frozen one.
+ */
+export const declaredClaudeCodeVersion =
+	HOST_CLAUDE_CODE_VERSION ?? CLAUDE_CODE_VERSION;
 
 const PI_DEFAULT_PROMPT_PREFIX =
 	"You are an expert coding assistant operating inside pi, a coding agent harness.";
@@ -1918,7 +1992,6 @@ const MINIMAL_ANTHROPIC_OAUTH_PROMPT = [
 ].join("\n");
 const CLAUDE_CODE_IDENTITY_PREFIX =
 	"You are Claude Code, Anthropic's official CLI";
-const CLAUDE_CODE_VERSION = "2.1.172";
 const BILLING_HEADER_SALT = "59cf53e54c78";
 const BILLING_HEADER_POSITIONS = [4, 7, 20] as const;
 const CLAUDE_CODE_ENTRYPOINT = "sdk-cli";
@@ -2015,12 +2088,12 @@ function buildBillingHeaderValue(
 		(index) => messageText[index] || "0",
 	).join("");
 	const suffix = createHash("sha256")
-		.update(`${BILLING_HEADER_SALT}${sampledCharacters}${CLAUDE_CODE_VERSION}`)
+		.update(`${BILLING_HEADER_SALT}${sampledCharacters}${declaredClaudeCodeVersion}`)
 		.digest("hex")
 		.slice(0, 3);
 	return [
 		"x-anthropic-billing-header:",
-		`cc_version=${CLAUDE_CODE_VERSION}.${suffix};`,
+		`cc_version=${declaredClaudeCodeVersion}.${suffix};`,
 		`cc_entrypoint=${CLAUDE_CODE_ENTRYPOINT};`,
 		`cch=${cch};`,
 	].join(" ");
@@ -2193,6 +2266,15 @@ function anthropicOAuthOverride(providerId: string, name: string) {
 // ===========================================================================
 
 export default function piMultiAccount(pi: ExtensionAPI) {
+	// A stale declared client version is invisible until Anthropic rejects a request,
+	// so say it out loud when the host pi could not be read. Non-fatal: the fallback
+	// value is used and every account keeps working.
+	if (!HOST_CLAUDE_CODE_VERSION) {
+		console.warn(
+			`pi-multi-account: could not read the Claude Code client version from the running pi (${findHostPiRoot() ?? "host package not found"}); ` +
+				`declaring the fallback ${declaredClaudeCodeVersion}. Anthropic rejects models newer than the declared client — check this value after a pi update.`,
+		);
+	}
 	// Warm up the OAuth helpers before any provider registration: providers are
 	// registered synchronously below and their `usesCallbackServer`/`getApiKey`
 	// read from the cached module. Deliberately NON-fatal — if pi-ai's oauth entry
