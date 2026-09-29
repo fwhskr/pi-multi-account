@@ -58,7 +58,7 @@
   "publishConfig": {
     "access": "public"
   },
-  "dependencies": {
+  "optionalDependencies": {
     "@earendil-works/pi-ai": ">=0.78"
   },
   "peerDependencies": {
