@@ -25,7 +25,9 @@ const AGENT_DIR = mkdtempSync(join(tmpdir(), "pmacct-task24-"));
 process.env.PI_CODING_AGENT_DIR = AGENT_DIR;
 process.env.PI_CURSOR_PROVIDER_ROOT = join(AGENT_DIR, "cursor-provider");
 
-const { default: piMultiAccount } = (await import("../index.ts")) as {
+const MODULE_INDEX = process.env.PI_MULTI_ACCOUNT_INDEX || "../index.ts";
+
+const { default: piMultiAccount } = (await import(MODULE_INDEX)) as {
 	default: (pi: any) => void;
 };
 
