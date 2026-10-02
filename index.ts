@@ -2605,8 +2605,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 					? "Your other accounts still work."
 					: "Log in again to restore it.";
 		return (
-			`Your login for ${names} has expired. Run /login, choose "Use a subscription", ` +
-			`then select ${names} to sign in again. ${reassurance}`
+			// Describe the /login action instead of quoting a menu label: the live runtime's
+			// top-level option is "Sign in with an account" (interactive-mode.js:4851, installed
+			// runtime), which can be relabelled; the account id below is stable and unique.
+			`Your login for ${names} has expired. Run /login, then select the entry for ` +
+			`${names} to sign in again. ${reassurance}`
 		);
 	}
 
@@ -5480,7 +5483,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				const loginHint =
 					family === "cursor"
 						? `run /login, authenticate your Cursor subscription in the browser, select ${id}`
-						: `run /login, choose "Use a subscription", select ${id}`;
+						: `run /login, then select the entry for ${id}`;
 				ctx.ui.notify(
 					`pi-multi-account: ${loginHint}, then run /multi-account rediscover`,
 					"info",
@@ -6160,7 +6163,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		const slotHint =
 			providers.length > 0 ? ` Select one of: ${providers.join(", ")}.` : "";
 		ctx.ui.notify(
-			`Provider failover: no usable authenticated account exists. Run /login, choose "Use a subscription", then select an account slot.${slotHint}`,
+			`Provider failover: no usable authenticated account exists. Run /login, then select an account slot.${slotHint}`,
 			"error",
 		);
 		return { action: "handled" as const };

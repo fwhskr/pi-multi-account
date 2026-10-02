@@ -7,7 +7,7 @@ When the account you are using hits a quota or rate limit, `pi-multi-account` tr
 ## What it does
 
 - **Auto-discovers** every authenticated account from `~/.pi/agent/auth.json` (Anthropic Claude Pro/Max, OpenAI/ChatGPT Codex, Qwen/Alibaba, and Ollama) and builds the failover rotation dynamically — no manual config editing.
-- **Grows the rotation on login.** Run `/login`, choose **Use a subscription**, then select a numbered slot such as `anthropic-account-3` or `openai-codex-account-5`. The next discovery sweep adds it to the rotation automatically.
+- **Grows the rotation on login.** Run `/login`, then select the entry for a numbered slot such as `anthropic-account-3` or `openai-codex-account-5`. The next discovery sweep adds it to the rotation automatically.
 - **Auto-discovers new Codex models per account.** At session start (and on `reload` / `rediscover`) it reads OpenAI's authenticated model catalog, mirrors each account's actually available models onto its Pi alias, and follows OpenAI's server priority. A new flagship can therefore win immediately without an extension release or a hard-coded model id.
 - **Handles auth failures without poisoning healthy OAuth accounts.** A generic final 401 briefly cools down a refreshable account and moves the current task forward. Explicit provider verdicts such as `authentication token has been invalidated` force an early refresh; if the refresh token is dead too, the slot is removed and Pi prints the interactive `/login` recovery steps.
 - **Fails over on quota / rate-limit** (429 / 402 / 403 and friends): the exhausted account goes on cooldown (parsed from the provider's own reset metadata when available) and Pi switches to the next available account/model.
@@ -51,7 +51,7 @@ Add accounts by opening the login picker:
 
 ```text
 /login
-Use a subscription
+Sign in with an account
 ChatGPT Plus/Pro (Codex openai-codex-account-2)
 /multi-account rediscover
 ```

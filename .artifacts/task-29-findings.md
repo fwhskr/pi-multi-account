@@ -39,3 +39,41 @@ README documents that older Pi (0.79.3) does not accept a provider argument afte
 
 `grep -n 'Use a subscription' index.ts` -> 2608, 5483, 6163 (three owner-reachable messages).
 Also `README.md` lines 10 and 54. All corrected; none deliberately left.
+
+## 5. RED / GREEN evidence
+
+RED (`timeout 120 node --test test/task-25-login-expiry-notice.test.ts`, exit 1):
+```text
+not ok 1 - expired login tells the owner exactly once, in plain language, with a footer status
+not ok 4 - the assistant-error kill path also tells the owner once, with the corrected wording
+# tests 5
+# pass 3
+# fail 2
+```
+actual old text quoted by the runner:
+`Your login for openai-codex-account-2 has expired. Run /login, choose "Use a subscription", then select openai-codex-account-2 to sign in again. Your other account still works.`
+
+GREEN after the wording fix (`timeout 120 node --test test/task-25-login-expiry-notice.test.ts`, exit 0):
+```text
+# tests 5
+# pass 5
+# fail 0
+```
+
+## 6. Full package suite (`timeout 180 node --test test/*.test.ts`)
+
+Exit 1:
+```text
+# tests 140
+# pass 139
+# fail 1
+```
+Only failure: `not ok 57 - OAuth-marked Anthropic payload gets one billing header`
+(`test/failover.test.ts:2357`, unrelated pre-existing version-string assertion:
+expected `/cc_version=2\.1\.172\./`, actual `cc_version=2.1.280.309`).
+My diff does not touch `test/failover.test.ts` (`git diff a5611e8 --name-only` -> 0 matches).
+
+## 7. Static check
+
+`npm run check` -> `tsc: command not found`, exit 127 (typescript is not installed in this worktree).
+The suite executing the real `index.ts` under Node 22 type stripping is the static-plus-runtime evidence.
