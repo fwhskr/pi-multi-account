@@ -319,6 +319,50 @@ test("a healthy account raises no login-expired notice", async () => {
 	}
 });
 
+test("the assistant-error kill path also tells the owner once, with the corrected wording", async () => {
+	// Before TASK-25 this path emitted its own "authorization is invalid" toast in addition to
+	// the expiry notice; that would be a second, wrongly-worded owner message per event.
+	const restore = installCatalogFetch([]);
+	try {
+		resetFiles({ [DEAD]: expiredDeadAccount() });
+		const pane = makeInstance({
+			accounts: { [DEAD]: expiredDeadAccount() },
+			current: { provider: DEAD, id: "gpt-5.5" },
+		});
+
+		await pane.fire("message_end", {
+			message: {
+				role: "assistant",
+				content: [],
+				provider: DEAD,
+				model: "gpt-5.5",
+				stopReason: "error",
+				errorMessage:
+					"Your authentication token has been invalidated. Please try signing in again.",
+				timestamp: Date.now(),
+			},
+		});
+
+		const notices = expiryNotices(pane.rec);
+		assert.equal(
+			notices.length,
+			1,
+			`expected one owner notice from the assistant-error path, got ${notices.length}: ${JSON.stringify(notices.map((n) => n.message))}`,
+		);
+		assert.match(notices[0].message, /\/login/);
+		assert.match(notices[0].message, /openai-codex-account-2/);
+		assert.ok(
+			!pane.rec.notifies.some((n) => /authorization is invalid/i.test(n.message)),
+			"the account must never be called invalid in owner-facing text",
+		);
+		assert.ok((readState().invalidatedByProvider ?? {})[DEAD]);
+
+		await pane.fire("session_shutdown");
+	} finally {
+		restore();
+	}
+});
+
 test("the notice clears after a fresh login restores the account", async () => {
 	const restore = installCatalogFetch([]);
 	try {
