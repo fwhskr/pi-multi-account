@@ -2615,7 +2615,42 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		persist();
 	}
 
+	// Cross-process invalidation visibility (TASK-24). invalidatedByProvider is a per-process
+	// cache loaded once at construction; a pane that did not itself discover a dead account
+	// never saw the record another pane persisted (and its own `persist()` could clobber it).
+	// Re-read the shared state file at a bounded cadence and union in records written elsewhere.
+	// Add-only by design: a record is dropped only by the credential-hash check in
+	// clearReauthedInvalidations (re-login / key replacement) or an explicit revive, never by
+	// this merge, so it can never resurrect an account the user re-logged. Bounded: one statSync
+	// per call, no watcher and no provider call; the state file is parsed only when its mtime
+	// actually changed.
+	let stateFileMtimeMs = -1;
+	function refreshInvalidationsFromDisk() {
+		let mtime: number;
+		let disk: ProviderFailoverState;
+		try {
+			mtime = statSync(STATE_PATH).mtimeMs;
+			if (mtime === stateFileMtimeMs) return;
+			disk = JSON.parse(readFileSync(STATE_PATH, "utf8")) as ProviderFailoverState;
+		} catch {
+			// No state file yet, or a concurrent writer's partial write — retry next call.
+			return;
+		}
+		stateFileMtimeMs = mtime;
+		let changed = false;
+		for (const [provider, record] of Object.entries(
+			disk.invalidatedByProvider ?? {},
+		)) {
+			if (!invalidatedByProvider.has(provider)) {
+				invalidatedByProvider.set(provider, record);
+				changed = true;
+			}
+		}
+		if (changed) clearReauthedInvalidations(readAuthFile());
+	}
+
 	function isInvalidated(provider: string) {
+		refreshInvalidationsFromDisk();
 		return invalidatedByProvider.has(provider);
 	}
 
@@ -2884,7 +2919,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 					cached &&
 					Date.now() - cached.fetchedAt < CODEX_MODEL_CATALOG_TTL_MS
 				) {
-					return;
+					return undefined;
 				}
 				try {
 					const models = preserveHostMaxReasoningLevel(
