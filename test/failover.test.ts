@@ -797,7 +797,11 @@ test("same Codex accountId in two slots is one rotation account and shares coold
 	);
 });
 
-test("declared-chain agents: global failover stands down, the profile chain owns the switch", async () => {
+test("declared-chain agents: cross-provider failover stands down, same-provider accounts still rotate", async () => {
+	// Contract change (TASK-21): the package used to stand down ENTIRELY for a
+	// declared-chain session. It now stands down only on the cross-provider move
+	// (the profile chain owns that dimension) while still rotating a same-provider
+	// limit onto another healthy account of the same family.
 	const accounts = {
 		"openai-codex": { type: "oauth", access: "a", refresh: "a-r", accountId: "main" },
 		"openai-codex-account-2": {
@@ -806,6 +810,7 @@ test("declared-chain agents: global failover stands down, the profile chain owns
 			refresh: "other-r",
 			accountId: "other-account",
 		},
+		anthropic: { type: "oauth", access: "x", refresh: "x-r" },
 	};
 	const agentsDir = join(AGENT_DIR, "agents");
 	mkdirSync(agentsDir, { recursive: true });
@@ -833,26 +838,39 @@ test("declared-chain agents: global failover stands down, the profile chain owns
 			accounts,
 			current: { provider: "openai-codex", id: "gpt-5.5" },
 			config: {
-				fallbacks: ["openai-codex-account-2"],
+				// Cross-provider candidate FIRST, so an un-scoped global chain would pick
+				// anthropic; preferLatestModel:false makes rotation order (not the
+				// per-family model rank) the deciding tiebreak.
+				fallbacks: ["anthropic", "openai-codex-account-2"],
+				preferLatestModel: false,
 				autoContinue: false,
 			},
 		});
 		await finishError(t, "openai-codex", "gpt-5.5", "429 usage_limit_reached");
 		assert.deepEqual(
 			t.rec.setModels,
-			[],
-			"global failover must not switch a declared-chain session",
-			);
+			["openai-codex-account-2/gpt-5.5"],
+			"a same-provider limit must rotate to another healthy account of that provider",
+		);
+		assert.ok(
+			!t.rec.setModels.some((model) => model.startsWith("anthropic/")),
+			"a declared-chain session must not get a cross-provider switch from the package",
+		);
 		assert.deepEqual(
 			t.rec.continueCalls,
 			[],
-			"a deferred switch must not arm a continuation",
-			);
+			"autoContinue is off, so no continuation is armed",
+		);
 		const state = t.readState();
+		assert.equal(
+			state.lastSwitches?.[0]?.to,
+			"openai-codex-account-2/gpt-5.5",
+			"the same-provider rotation is recorded as a real switch event",
+		);
 		assert.ok(
-			!state.exhaustedUntilByProvider?.["openai-codex-account-2"],
-			"a deferred switch must not poison the fallback target",
-			);
+			!state.invalidatedByProvider?.["openai-codex-account-2"],
+			"the rotated-to account stays healthy",
+		);
 	} finally {
 		if (previousAgent === undefined) delete process.env.SULA_DESKTOP_AGENT;
 		else process.env.SULA_DESKTOP_AGENT = previousAgent;
@@ -901,7 +919,10 @@ test("agent without declared fallbacks keeps global failover (stand-down is scop
 	}
 });
 
-test("producer-shaped identity: PI_HERDR_PERSONA alone stands the global chain down", async () => {
+test("producer-shaped identity: PI_HERDR_PERSONA alone still defers cross-provider but rotates same-provider", async () => {
+	// Contract change (TASK-21): PI_HERDR_PERSONA alone still marks the session as
+	// declared-chain (so the profile chain owns cross-provider), but the package now
+	// keeps the same-provider account rotation it used to give up entirely.
 	const accounts = {
 		"openai-codex": { type: "oauth", access: "a", refresh: "a-r", accountId: "main" },
 		"openai-codex-account-2": {
@@ -910,6 +931,7 @@ test("producer-shaped identity: PI_HERDR_PERSONA alone stands the global chain d
 			refresh: "other-r",
 			accountId: "other-account",
 		},
+		anthropic: { type: "oauth", access: "x", refresh: "x-r" },
 	};
 	const agentsDir = join(AGENT_DIR, "agents");
 	mkdirSync(agentsDir, { recursive: true });
@@ -928,13 +950,21 @@ test("producer-shaped identity: PI_HERDR_PERSONA alone stands the global chain d
 		const t = setup({
 			accounts,
 			current: { provider: "openai-codex", id: "gpt-5.5" },
-			config: { fallbacks: ["openai-codex-account-2"], autoContinue: false },
+			config: {
+				fallbacks: ["anthropic", "openai-codex-account-2"],
+				preferLatestModel: false,
+				autoContinue: false,
+			},
 		});
 		await finishError(t, "openai-codex", "gpt-5.5", "429 usage_limit_reached");
 		assert.deepEqual(
 			t.rec.setModels,
-			[],
-			"the launcher's identity variable alone must stand the global chain down",
+			["openai-codex-account-2/gpt-5.5"],
+			"PI_HERDR_PERSONA alone still rotates same-provider accounts",
+		);
+		assert.ok(
+			!t.rec.setModels.some((model) => model.startsWith("anthropic/")),
+			"the launcher's identity variable alone must stand the CROSS-provider chain down",
 		);
 	} finally {
 		if (prevDesktop === undefined) delete process.env.SULA_DESKTOP_AGENT;
@@ -943,6 +973,147 @@ test("producer-shaped identity: PI_HERDR_PERSONA alone stands the global chain d
 		else process.env.PI_SUBAGENT_AGENT = prevSubagent;
 		if (prevHerdr === undefined) delete process.env.PI_HERDR_PERSONA;
 		else process.env.PI_HERDR_PERSONA = prevHerdr;
+		rmSync(profilePath, { force: true });
+	}
+});
+
+test("declared-chain agents: only cross-provider candidates defer the switch and log it", async () => {
+	// AC#5(a): when the same family has no other healthy account, the package must
+	// still stand down (cross-provider is the profile chain's job), log the deferral,
+	// and never call setModel.
+	const accounts = {
+		"openai-codex": { type: "oauth", access: "a", refresh: "a-r", accountId: "main" },
+		anthropic: { type: "oauth", access: "x", refresh: "x-r" },
+	};
+	const agentsDir = join(AGENT_DIR, "agents");
+	mkdirSync(agentsDir, { recursive: true });
+	const profilePath = join(agentsDir, "deep.md");
+	writeFileSync(
+		profilePath,
+		"---\nmodel: openai-codex/gpt-6-astra\nthinking: low\nfallbacks:\n  - provider: opencode-go\n    model: muse-spark-1.3-contributor\n    thinking: xhigh\n---\n\nbody\n",
+	);
+	const previousAgent = process.env.SULA_DESKTOP_AGENT;
+	process.env.SULA_DESKTOP_AGENT = "deep";
+	rmSync(DEBUG_LOG, { force: true });
+	try {
+		const t = setup({
+			accounts,
+			current: { provider: "openai-codex", id: "gpt-5.5" },
+			config: { fallbacks: ["anthropic"], autoContinue: false },
+		});
+		await finishError(t, "openai-codex", "gpt-5.5", "429 usage_limit_reached");
+		assert.deepEqual(
+			t.rec.setModels,
+			[],
+			"a declared-chain session with only cross-provider candidates must not switch",
+		);
+		const events = readDebugLog();
+		assert.ok(
+			events.some(
+				(event) =>
+					event.kind === "switch-deferred" &&
+					event.to === "agent-profile-fallback-chain",
+			),
+			`the deferral must be logged; events=${events.map((event) => event.kind).join(",")}`,
+		);
+		assert.ok(
+			!events.some((event) => event.kind === "switch"),
+			"a deferred switch must not emit a switch event",
+		);
+	} finally {
+		if (previousAgent === undefined) delete process.env.SULA_DESKTOP_AGENT;
+		else process.env.SULA_DESKTOP_AGENT = previousAgent;
+		rmSync(profilePath, { force: true });
+	}
+});
+
+test("declared-chain agents: same-provider rotation skips a dead/invalidated account", async () => {
+	// AC#5(b): a real same-provider switch event is recorded and the chosen model is
+	// the healthy same-family account; an invalidated account is never the target.
+	const deadHash = createHash("sha256")
+		.update("dead-2")
+		.digest("hex")
+		.slice(0, 12);
+	const accounts = {
+		"openai-codex": { type: "oauth", access: "a", refresh: "a-r", accountId: "main" },
+		"openai-codex-account-2": {
+			type: "oauth",
+			access: "dead-2",
+			refresh: "dead-2-r",
+			accountId: "dead-account",
+		},
+		"openai-codex-account-3": {
+			type: "oauth",
+			access: "live-3",
+			refresh: "live-3-r",
+			accountId: "live-account",
+		},
+	};
+	const agentsDir = join(AGENT_DIR, "agents");
+	mkdirSync(agentsDir, { recursive: true });
+	const profilePath = join(agentsDir, "deep.md");
+	writeFileSync(
+		profilePath,
+		"---\nmodel: openai-codex/gpt-6-astra\nthinking: low\nfallbacks:\n  - provider: opencode-go\n    model: muse-spark-1.3-contributor\n    thinking: xhigh\n---\n\nbody\n",
+	);
+	const previousAgent = process.env.SULA_DESKTOP_AGENT;
+	process.env.SULA_DESKTOP_AGENT = "deep";
+	try {
+		const t = setup({
+			accounts,
+			current: { provider: "openai-codex", id: "gpt-5.5" },
+			config: {
+				// The invalidated account is listed FIRST, so a broken invalidation
+				// filter would rotate onto it.
+				fallbacks: ["openai-codex-account-2", "openai-codex-account-3"],
+				preferLatestModel: false,
+				autoContinue: false,
+			},
+			seedState: {
+				stateVersion: 5,
+				exhaustedUntilByProvider: {},
+				exhaustedUntilByModel: {},
+				lastProbeAtByProvider: {},
+				invalidatedByProvider: {
+					"openai-codex-account-2": {
+						tokenHash: deadHash,
+						at: Date.now(),
+						reason: "refresh token invalidated",
+					},
+				},
+				lastSwitches: [],
+			},
+		});
+		await finishError(t, "openai-codex", "gpt-5.5", "429 usage_limit_reached");
+		assert.deepEqual(
+			t.rec.setModels,
+			["openai-codex-account-3/gpt-5.5"],
+			"the healthy same-provider account is the rotation target",
+		);
+		assert.ok(
+			!t.rec.setModels.some((model) =>
+				model.startsWith("openai-codex-account-2/"),
+			),
+			"an invalidated account must never be the rotation target",
+		);
+		const state = t.readState();
+		assert.equal(
+			state.lastSwitches?.[0]?.from,
+			"openai-codex/gpt-5.5",
+			"a real switch event records the source",
+		);
+		assert.equal(
+			state.lastSwitches?.[0]?.to,
+			"openai-codex-account-3/gpt-5.5",
+			"a real switch event records the same-provider target",
+		);
+		assert.ok(
+			state.invalidatedByProvider?.["openai-codex-account-2"],
+			"the dead account stays out of rotation",
+		);
+	} finally {
+		if (previousAgent === undefined) delete process.env.SULA_DESKTOP_AGENT;
+		else process.env.SULA_DESKTOP_AGENT = previousAgent;
 		rmSync(profilePath, { force: true });
 	}
 });
