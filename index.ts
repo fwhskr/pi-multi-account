@@ -603,6 +603,10 @@ const BUSY_RETRY_REASON = "previous turn was still busy; auto-retry";
 // is the other half of this fix.
 const MAX_CONSECUTIVE_AUTH_FAILURES = 8;
 const TRANSIENT_AUTH_COOLDOWN_MS = 60 * 1000; // brief skip after a 401 so the next call can refresh
+// A refreshable credential whose access token is already expired and which keeps returning 401
+// on the per-account catalogue cannot be repaired by waiting. After this many consecutive
+// catalogue 401s the slot is invalidated so it stops 401-looping and leaves the rotation pool.
+const CATALOG_AUTH_FAILURE_LIMIT = 3;
 
 // For non-refreshable (API-key) providers, repeated 401s with the SAME key are not a
 // transient blip — the key is permanently invalid. After this many consecutive same-key
@@ -1307,6 +1311,19 @@ function isEntryUsable(entry: AuthEntry | undefined): boolean {
 		return false;
 	}
 	return true;
+}
+
+/** True when the stored access token is provably expired (JWT `exp` or stored `expires`). */
+function accessTokenExpired(entry: AuthEntry | undefined): boolean {
+	if (!entry) return false;
+	const storedExpiry =
+		typeof entry.expires === "number" && Number.isFinite(entry.expires)
+			? entry.expires < 10_000_000_000
+				? entry.expires * 1000
+				: entry.expires
+			: undefined;
+	const expMs = jwtExpMs(entry.access ?? "") ?? storedExpiry;
+	return expMs !== undefined && expMs <= Date.now();
 }
 
 // ---------------------------------------------------------------------------
@@ -2316,6 +2333,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// advance toward a permanent kill, so a refreshable account whose refresh isn't reaching the wire
 	// is never wrongly revoked.
 	const authFailures = new Map<string, { hash: string; distinct: number }>();
+	// Consecutive catalogue-401 streak for a locally-expired refreshable credential. Reset on a
+	// successful probe or a successful refresh. Bounded invalidation is what ends the 401 hot loop.
+	const catalogAuthFailures = new Map<string, number>();
 	// Response headers arrive before the final assistant message. Keep their cooldown hints, but
 	// never switch accounts from that early hook: Pi may still be retrying the same HTTP request.
 	const responseCooldownHints = new Map<string, number>();
@@ -2819,7 +2839,18 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				throw error;
 			}
 			const refreshed = await forceRefreshProvider(ctx, provider);
+			if (refreshed.status === "terminal") {
+				// A terminal refresh verdict cannot be waited out: drop the slot now so it
+				// stops being probed and can never be chosen as a rotation target.
+				catalogAuthFailures.delete(provider);
+				markInvalid(
+					provider,
+					`OAuth refresh failed permanently: ${refreshed.error}`,
+				);
+				throw error;
+			}
 			if (refreshed.status !== "refreshed") throw error;
+			catalogAuthFailures.delete(provider);
 			entry = readAuthFile()[provider];
 			if (!entry) throw error;
 			return runFetch();
@@ -2837,7 +2868,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		const providers = Object.keys(auth).filter(
 			(provider) =>
 				classifyProvider(provider, config.qwenProvider) === "openai-codex" &&
-				isEntryUsable(auth[provider]),
+				isEntryUsable(auth[provider]) &&
+				!isInvalidated(provider),
 		);
 		const registryFallback = mergeCodexModels(
 			registryCodexModels(ctx),
@@ -2864,6 +2896,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 						models,
 					});
 					changed = true;
+					catalogAuthFailures.delete(provider);
 					logEvent("model_catalog_refresh", {
 						provider,
 						models: models.map((model) => model.id).join(","),
@@ -2873,6 +2906,27 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 						provider,
 						error: error instanceof Error ? error.message : String(error),
 					});
+					// A 401 on the per-account catalogue is an auth failure. A refreshable
+					// credential that keeps 401ing while its stored access token is already
+					// expired cannot be repaired by waiting, so invalidate it after a bounded
+					// streak. This is what ends the 401 hot loop for a dead account.
+					if (
+						error instanceof CodexCatalogFetchError &&
+						error.status === 401 &&
+						accessTokenExpired(readAuthFile()[provider])
+					) {
+						const streak = (catalogAuthFailures.get(provider) ?? 0) + 1;
+						if (streak >= CATALOG_AUTH_FAILURE_LIMIT) {
+							catalogAuthFailures.delete(provider);
+							markInvalid(
+								provider,
+								`access token expired and could not be refreshed (after ${streak} catalogue 401s)`,
+							);
+						} else {
+							catalogAuthFailures.set(provider, streak);
+							markExhausted(provider, TRANSIENT_AUTH_COOLDOWN_MS);
+						}
+					}
 				}
 			}),
 		);
@@ -3398,6 +3452,12 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			} else if (usageMs !== undefined && usageMs > 0) {
 				hintedCooldowns.push(usageMs);
 			}
+		} else if (streak >= 2) {
+			// No live usage reading (for example showUsage is off) and this account has now
+			// limit-errored twice in a row: the weekly window cannot see a session/rate limit,
+			// so the momentary config.cooldownMs is not credible. Apply the same session-limit
+			// floor the "usage says free" branch uses instead of collapsing to cooldownMs.
+			hintedCooldowns.push(SESSION_LIMIT_FLOOR_MS);
 		}
 		if (hintedCooldowns.length === 0) return config.cooldownMs;
 		// Backstop: never let a single live estimate lock an account beyond the ceiling.
@@ -4017,26 +4077,43 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		reason: string,
 		options: { armContinuation?: boolean } = {},
 	) {
-		// Declared-chain sessions: stand down completely — the agent profile's
-		// own fallback chain owns failover and per-fallback thinking here.
+		// Declared-chain sessions: the agent profile's own fallback chain owns the
+		// CROSS-provider move and per-fallback thinking. Same-provider ACCOUNT
+		// rotation is still ours — the account dimension is not part of the profile
+		// chain — so keep only same-family candidates and defer only when no
+		// healthy same-family account remains.
+		let effectiveCandidates = candidates;
 		if (sessionAgentHasDeclaredFallbackChain(ctx)) {
-			const deferredFrom =
-				sourceModel?.provider && sourceModel?.id
-					? ref(sourceModel.provider, sourceModel.id)
-					: "unavailable/account";
-			logEvent("switch-deferred", {
-				from: deferredFrom,
-				reason,
-				to: "agent-profile-fallback-chain",
-			});
-			return;
+			const sourceFamily = classifyProvider(
+				sourceModel?.provider,
+				config.qwenProvider,
+			);
+			effectiveCandidates = sourceFamily
+				? candidates.filter(
+						(candidate) =>
+							classifyProvider(candidate?.provider, config.qwenProvider) ===
+							sourceFamily,
+					)
+				: [];
+			if (effectiveCandidates.length === 0) {
+				const deferredFrom =
+					sourceModel?.provider && sourceModel?.id
+						? ref(sourceModel.provider, sourceModel.id)
+						: "unavailable/account";
+				logEvent("switch-deferred", {
+					from: deferredFrom,
+					reason,
+					to: "agent-profile-fallback-chain",
+				});
+				return;
+			}
 		}
 		const from =
 			sourceModel?.provider && sourceModel?.id
 				? ref(sourceModel.provider, sourceModel.id)
 				: ("unavailable/account" as ModelRef);
 		const failedProviders = new Set<string>();
-		for (const fallback of candidates) {
+		for (const fallback of effectiveCandidates) {
 			if (failedProviders.has(fallback.provider)) continue;
 			const to = ref(fallback.provider, fallback.id);
 			if (to === from) {
