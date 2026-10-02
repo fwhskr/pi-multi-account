@@ -2591,6 +2591,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// forgets a provider as soon as its invalidation clears, so a later expiry of a
 	// re-logged-in slot tells the owner again.
 	const loginExpiryNotified = new Set<string>();
+	// Whether the persistent footer status is currently shown, so a healthy start does not
+	// push a spurious clear entry into the host UI.
+	let loginExpiryStatusShown = false;
 
 	function ownerLoginExpiredText(providers: string[]): string {
 		const names = providers.join(", ");
@@ -2635,10 +2638,13 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		}
 		try {
 			if (typeof ctx?.ui?.setStatus === "function") {
-				ctx.ui.setStatus(
-					"multi-account-login",
-					expired.length > 0 ? ownerLoginExpiredStatus(expired) : undefined,
-				);
+				if (expired.length > 0) {
+					ctx.ui.setStatus("multi-account-login", ownerLoginExpiredStatus(expired));
+					loginExpiryStatusShown = true;
+				} else if (loginExpiryStatusShown) {
+					ctx.ui.setStatus("multi-account-login", undefined);
+					loginExpiryStatusShown = false;
+				}
 			}
 		} catch {
 			/* footer is cosmetic */
@@ -6374,10 +6380,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				killed = markAuthFailure(provider, errorText, ctx);
 			}
 			if (killed) {
-				ctx.ui.notify(
-					`Provider failover: ${provider} authorization is invalid. Run /login, choose "Use a subscription", then select ${provider}.`,
-					"warning",
-				);
+				// The owner-facing "login expired" notice is emitted once by markInvalid (TASK-25),
+				// so this path adds no second toast and never calls the account itself bad.
 			}
 			// A killed account is already in invalidatedByProvider (no cooldown entry needed —
 			// that was the v1.8.x "8696h cooldown" bug). A transient auth failure gets the brief
