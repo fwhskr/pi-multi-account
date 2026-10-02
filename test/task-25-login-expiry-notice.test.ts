@@ -232,6 +232,19 @@ test("expired login tells the owner exactly once, in plain language, with a foot
 		assert.match(text, /openai-codex-account-2/, "the notice must name the account");
 		assert.match(text, /\/login/, "the notice must give the exact action /login");
 		assert.match(text, /other account/i, "the notice must reassure that other accounts still work");
+		// TASK-29: the runtime's live top-level option is "Sign in with an account"
+		// (interactive-mode.js:4851 in the installed pi runtime; the Codex slot sets no
+		// loginLabel). The notice must not name the removed "Use a subscription" option.
+		assert.match(
+			text,
+			/then select the entry for openai-codex-account-2/i,
+			"the notice must describe the /login action without quoting a removed menu option",
+		);
+		assert.doesNotMatch(
+			text,
+			/Use a subscription/i,
+			"the notice must not name the removed 'Use a subscription' menu option",
+		);
 		assert.doesNotMatch(
 			text,
 			/\bdead\b|invalid|remove|revoked|bad account/i,
@@ -351,6 +364,11 @@ test("the assistant-error kill path also tells the owner once, with the correcte
 		);
 		assert.match(notices[0].message, /\/login/);
 		assert.match(notices[0].message, /openai-codex-account-2/);
+		assert.doesNotMatch(
+			notices[0].message,
+			/Use a subscription/i,
+			"the assistant-error path must not name the removed 'Use a subscription' menu option",
+		);
 		assert.ok(
 			!pane.rec.notifies.some((n) => /authorization is invalid/i.test(n.message)),
 			"the account must never be called invalid in owner-facing text",
