@@ -2583,6 +2583,68 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 
 	// ----- invalidation (dead authorization) --------------------------------
 
+	// TASK-25: the owner must be told when a login expires, on a surface they actually
+	// look at, without running anything and without reading the debug log. `markInvalid`
+	// is the single write point for a permanent invalidation (a temporary cooldown goes
+	// through markExhausted and never reaches here), so it is the one place that can emit
+	// the notice exactly once per expiry event. `loginExpiryNotified` is per-process and
+	// forgets a provider as soon as its invalidation clears, so a later expiry of a
+	// re-logged-in slot tells the owner again.
+	const loginExpiryNotified = new Set<string>();
+
+	function ownerLoginExpiredText(providers: string[]): string {
+		const names = providers.join(", ");
+		const healthy = rotation.filter((provider) => !invalidatedByProvider.has(provider)).length;
+		const reassurance =
+			healthy === 1
+				? "Your other account still works."
+				: healthy > 1
+					? "Your other accounts still work."
+					: "Log in again to restore it.";
+		return (
+			`Your login for ${names} has expired. Run /login, choose "Use a subscription", ` +
+			`then select ${names} to sign in again. ${reassurance}`
+		);
+	}
+
+	function ownerLoginExpiredStatus(providers: string[]): string {
+		return `Login expired: ${providers.join(", ")} · run /login`;
+	}
+
+	/**
+	 * Surface the set of expired logins on the owner's UI. Called at session start (to
+	 * surface records another pane persisted) and after any invalidation change. Emits one
+	 * notification per NEWLY expired provider, sets a persistent footer status while any
+	 * login is expired, and clears that footer once they are restored.
+	 */
+	function syncLoginExpiryNotice(ctx: any) {
+		const expired = [...invalidatedByProvider.keys()];
+		const newly = expired.filter((provider) => !loginExpiryNotified.has(provider));
+		for (const provider of newly) loginExpiryNotified.add(provider);
+		if (newly.length > 0) {
+			try {
+				ctx?.ui?.notify?.(ownerLoginExpiredText(newly), "warning");
+			} catch {
+				/* a notice that throws must never break the failover path */
+			}
+		}
+		// A provider no longer invalidated was re-logged in; forget it so a future expiry of
+		// the same slot notifies the owner again.
+		for (const provider of [...loginExpiryNotified]) {
+			if (!invalidatedByProvider.has(provider)) loginExpiryNotified.delete(provider);
+		}
+		try {
+			if (typeof ctx?.ui?.setStatus === "function") {
+				ctx.ui.setStatus(
+					"multi-account-login",
+					expired.length > 0 ? ownerLoginExpiredStatus(expired) : undefined,
+				);
+			}
+		} catch {
+			/* footer is cosmetic */
+		}
+	}
+
 	function clearReauthedInvalidations(auth: Record<string, AuthEntry>) {
 		let changed = false;
 		for (const [provider, record] of [...invalidatedByProvider.entries()]) {
@@ -2593,13 +2655,14 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				invalidatedByProvider.delete(provider);
 				exhaustedUntilByProvider.delete(provider);
 				authFailures.delete(provider);
+				loginExpiryNotified.delete(provider);
 				changed = true;
 			}
 		}
 		if (changed) persist();
 	}
 
-	function markInvalid(provider: string, reason: string) {
+	function markInvalid(provider: string, reason: string, ctx?: any) {
 		const entry = readAuthFile()[provider];
 		const tokenHash = entry ? (credentialHash(entry) ?? "") : "";
 		invalidatedByProvider.set(provider, {
@@ -2613,6 +2676,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// limited. Selection logic checks isInvalidated() directly, so the cooldown entry is
 		// redundant. State stays clean: invalidated providers are reported separately.
 		persist();
+		syncLoginExpiryNotice(ctx);
 	}
 
 	// Cross-process invalidation visibility (TASK-24). invalidatedByProvider is a per-process
@@ -2881,6 +2945,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				markInvalid(
 					provider,
 					`OAuth refresh failed permanently: ${refreshed.error}`,
+					ctx,
 				);
 				throw error;
 			}
@@ -2956,6 +3021,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 							markInvalid(
 								provider,
 								`access token expired and could not be refreshed (after ${streak} catalogue 401s)`,
+								ctx,
 							);
 						} else {
 							catalogAuthFailures.set(provider, streak);
@@ -3244,17 +3310,20 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	}
 
 	/** A successful response → this account's auth is fine; clear its 401 streak. */
-	function noteAuthSuccess(provider: string, modelId?: string) {
+	function noteAuthSuccess(provider: string, modelId?: string, ctx?: any) {
 		// A real success proves the account works right now → the usage reading was not lying; reset
 		// the limit-error streak and re-trust usage for this provider.
 		limitStreakByProvider.delete(provider);
 		usageUntrustedUntilByProvider.delete(provider);
 		let changed = authFailures.delete(provider);
 		changed = exhaustedUntilByProvider.delete(provider) || changed;
-		changed = invalidatedByProvider.delete(provider) || changed;
+		const wasInvalidated = invalidatedByProvider.delete(provider);
+		changed = wasInvalidated || changed;
 		if (modelId)
 			changed = exhaustedUntilByModel.delete(ref(provider, modelId)) || changed;
 		if (changed) persist();
+		// A success that clears an invalidation also clears the owner's footer notice (TASK-25).
+		if (wasInvalidated) syncLoginExpiryNotice(ctx);
 	}
 
 	/**
@@ -3277,10 +3346,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	 * distinct refreshed tokens fail do we mark it dead-until-relogin.
 	 * Returns true if the account was permanently invalidated.
 	 */
-	function markAuthFailure(provider: string, reason: string): boolean {
+	function markAuthFailure(provider: string, reason: string, ctx?: any): boolean {
 		if (patternMatch(reason, TERMINAL_AUTH_ERROR_PATTERNS)) {
 			authFailures.delete(provider);
-			markInvalid(provider, reason);
+			markInvalid(provider, reason, ctx);
 			return true;
 		}
 		const entry = readAuthFile()[provider];
@@ -3297,7 +3366,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				const distinct = (prev.distinct ?? 0) + 1;
 				if (distinct >= MAX_SAME_KEY_AUTH_FAILURES) {
 					authFailures.delete(provider);
-					markInvalid(provider, `${reason} (after ${distinct} same-key 401s)`);
+					markInvalid(provider, `${reason} (after ${distinct} same-key 401s)`, ctx);
 					return true;
 				}
 				authFailures.set(provider, { hash, distinct });
@@ -3312,6 +3381,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			markInvalid(
 				provider,
 				`${reason} (after ${distinct} refreshed-token 401s)`,
+				ctx,
 			);
 			return true;
 		}
@@ -5974,6 +6044,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				"warning",
 			);
 		}
+		// TASK-25: surface any expired login already on disk (written by another pane or a
+		// previous process) and restore the persistent footer notice. Cheap: one state read.
+		refreshInvalidationsFromDisk();
+		syncLoginExpiryNotice(ctx);
 		// Refresh every account BEFORE deciding the selected model is unavailable. Otherwise a
 		// plan upgrade can revive the current account milliseconds after startup preflight has
 		// already switched away from it using the old plan's stale 100% snapshot.
@@ -6005,6 +6079,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		responseCooldownHints.clear();
 		handledAssistantErrors.clear();
 		ctx?.ui?.setStatus?.("multi-account-quota", undefined);
+		ctx?.ui?.setStatus?.("multi-account-login", undefined);
 	});
 
 	// Make compaction survive account exhaustion. When the active account is rate-limited /
@@ -6157,7 +6232,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		if (!config.enabled) return;
 		const status = (event as any).status;
 		if (status < 400 && ctx.model) {
-			noteAuthSuccess(ctx.model.provider, ctx.model.id);
+			noteAuthSuccess(ctx.model.provider, ctx.model.id, ctx);
 			noteRecoveryProgress(); // a good response → recovery works → close the breaker
 			responseCooldownHints.delete(ctx.model.provider);
 			return;
@@ -6183,7 +6258,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		const message = (event as any).message;
 		if (message?.role !== "assistant") return;
 		if (message.stopReason !== "error") {
-			if (message.provider) noteAuthSuccess(message.provider, message.model);
+			if (message.provider) noteAuthSuccess(message.provider, message.model, ctx);
 			return;
 		}
 		if (userAbortedChain || ctx.signal?.aborted) return; // user is cancelling — don't fail over
@@ -6270,7 +6345,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			) {
 				const refresh = await forceRefreshProvider(ctx, provider);
 				if (refresh.status === "refreshed") {
-					noteAuthSuccess(provider, modelId);
+					noteAuthSuccess(provider, modelId, ctx);
 					const target = ref(provider, modelId);
 					currentPromptSwitch = {
 						from: target,
@@ -6287,16 +6362,16 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				}
 				if (refresh.status === "terminal") {
 					reason = `OAuth refresh failed permanently: ${refresh.error}`;
-					markInvalid(provider, reason);
+					markInvalid(provider, reason, ctx);
 					killed = true;
 				} else if (refresh.status === "transient") {
 					reason = `OAuth refresh failed temporarily: ${refresh.error}`;
 					markExhausted(provider, config.transientCooldownMs);
 				} else {
-					killed = markAuthFailure(provider, errorText);
+					killed = markAuthFailure(provider, errorText, ctx);
 				}
 			} else {
-				killed = markAuthFailure(provider, errorText);
+				killed = markAuthFailure(provider, errorText, ctx);
 			}
 			if (killed) {
 				ctx.ui.notify(
