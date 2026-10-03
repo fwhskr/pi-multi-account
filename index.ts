@@ -2418,32 +2418,29 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// (auto-continue paused) stays in effect once tripped.
 	let recoveryFailures = 0;
 	let breakerOpenUntil = 0;
-	// The thinking level the user intended for this turn. pi.setModel() re-clamps and
-	// persists the thinking level on every model switch, so without this it drifts
-	// downward across failovers ("thinking level keeps dropping"). We capture it before
-	// any switch and re-assert it after each successful switch.
-	let desiredThinkingLevel: any;
+	function currentThinking() {
+		// Agent/CLI/manual selection wins; the package default is for older hosts only.
+		return (pi as any).getThinkingLevel?.() ?? config.reasoningLevel;
+	}
 
-	function captureDesiredThinking() {
-		// Capture the session's ACTUAL thinking level (the per-agent configured value,
-		// e.g. Mimir=low, Brokkr=high) rather than the global config.reasoningLevel.
-		// Using the global default here clobbered per-agent thinking on every agent_start.
-		// This still preserves the level across failovers via restoreDesiredThinking.
-		desiredThinkingLevel = (pi as any).getThinkingLevel?.() ?? config.reasoningLevel;
+	function applyThinking(level: any) {
 		try {
-			(pi as any).setThinkingLevel?.(desiredThinkingLevel);
+			(pi as any).setThinkingLevel?.(level);
 		} catch {
 			/* older hosts clamp or reject unsupported levels; failover remains functional */
 		}
 	}
 
-	function restoreDesiredThinking() {
-		if (!desiredThinkingLevel) return;
-		try {
-			(pi as any).setThinkingLevel?.(desiredThinkingLevel);
-		} catch {
-			/* setThinkingLevel clamps to model caps; ignore if unsupported */
-		}
+	async function setModelPreservingThinking(
+		model: Parameters<ExtensionAPI["setModel"]>[0],
+	) {
+		// setModel applies model/global defaults even on an automatic account hop.
+		// Capture HERE, not at agent_start: startup/input preflight runs earlier,
+		// and a profile fallback or manual effort change may have selected a new level.
+		const thinking = currentThinking();
+		const selected = await pi.setModel(model);
+		if (selected) applyThinking(thinking); // host still clamps to destination caps
+		return selected;
 	}
 
 	// Named-agent fallback-chain ownership (owner bug report 2026-09-21):
@@ -2451,7 +2448,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// chain, that chain (agent-fallback-chain.ts) owns model failover AND the
 	// per-fallback thinking level. Our global fallback list switching here preempts
 	// that chain (it then aborts: "active model no longer matches the failed
-	// attempt") and restoreDesiredThinking() re-asserts the STALE pre-failure
+	// attempt") and restoring turn-start thinking re-asserted the STALE pre-failure
 	// level (the profile's primary thinking) over the declared per-fallback
 	// thinking. Observed live: deep (fallbacks muse-spark@xhigh, deepseek@high)
 	// landed on undeclared zai/glm-5.3-flash at profile-default low, then flapped
@@ -4242,7 +4239,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			) {
 				automaticModelTarget = to;
 				try {
-					ok = await pi.setModel(fallback);
+					ok = await setModelPreservingThinking(fallback);
 				} catch {
 					ok = false;
 				}
@@ -4255,7 +4252,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				if (providerHasUsableAuth(ctx, fallback.provider)) {
 					automaticModelTarget = to;
 					try {
-						ok = await pi.setModel(fallback);
+						ok = await setModelPreservingThinking(fallback);
 					} catch {
 						ok = false;
 					}
@@ -4275,7 +4272,6 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				failedProviders.add(fallback.provider);
 				continue;
 			}
-			restoreDesiredThinking();
 			setLastProbe(fallback.provider);
 			const record = { from, to, reason, at: Date.now() };
 			currentPromptSwitch =
@@ -5049,7 +5045,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				) {
 					automaticModelTarget = same;
 					try {
-						await pi.setModel(
+						await setModelPreservingThinking(
 							ctx.modelRegistry.find(sourceModel.provider, sourceModel.id) ?? {
 								provider: sourceModel.provider,
 								id: sourceModel.id,
@@ -6199,7 +6195,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		automaticModelTarget = undefined;
 		responseCooldownHints.clear();
 		handledAssistantErrors.clear();
-		captureDesiredThinking(); // remember the level BEFORE any failover can clamp it
+		applyThinking(currentThinking()); // preserve current selection; legacy hosts use the package default
 		refreshDiscovery(false, ctx); // also refresh Pi's in-memory AuthStorage
 		if (!usageStatusTimer) startUsageStatusTimer(ctx);
 		updateUsageStatus(ctx);

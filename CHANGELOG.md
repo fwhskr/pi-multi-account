@@ -5,6 +5,15 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Preserve the current reasoning effort at every extension-owned model switch, including
+  startup/input preflight and pending same-model resume. Pi applies model/global thinking defaults
+  during `setModel`; capture before that call and restore after success rather than first capturing
+  at `agent_start`, which can be too late. Explicit `max` and later user changes remain intact.
+
 ## [1.14.1] - 2026-07-27
 
 ### Fixed

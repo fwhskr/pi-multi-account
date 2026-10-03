@@ -129,6 +129,9 @@ function setup(opts: {
 	omitSendUserMessage?: boolean;
 	/** Models the HOST (Pi) itself publishes for the base Codex provider. */
 	hostCodexModels?: string[];
+	/** TASK-45: opt into the real host's mutable effort/model-default semantics. */
+	thinking?: string;
+	modelThinkingDefault?: string;
 }) {
 	const accounts = opts.accounts ?? TWO_ACCOUNTS;
 	writeFileSync(AUTH, JSON.stringify(accounts));
@@ -182,6 +185,7 @@ function setup(opts: {
 		authReloads: 0,
 	};
 	let idle = opts.idle ?? true;
+	let thinking = opts.thinking ?? "high";
 	const events: Record<string, (event: any, ctx?: any) => any> = {};
 	const commands: Record<string, (args: string, ctx: any) => any> = {};
 
@@ -270,6 +274,7 @@ function setup(opts: {
 			rec.setModels.push(target);
 			if (opts.setModelFailures?.includes(target)) return false;
 			ctx.model = mkModel(model.provider, model.id);
+			if (opts.modelThinkingDefault) thinking = opts.modelThinkingDefault;
 			await events.model_select?.(
 				{ model: ctx.model, previousModel, source: "set" },
 				ctx,
@@ -284,8 +289,11 @@ function setup(opts: {
 			if (opts.continueBlocks) await opts.continueBlocks();
 		},
 		appendEntry: () => {},
-		getThinkingLevel: () => "high",
-		setThinkingLevel: (level: string) => rec.thinkingLevels.push(level),
+		getThinkingLevel: () => opts.thinking === undefined ? "high" : thinking,
+		setThinkingLevel: (level: string) => {
+			if (opts.thinking !== undefined) thinking = level;
+			rec.thinkingLevels.push(level);
+		},
 	};
 
 	// Simulate a host Pi build that predates pi.continueAgent() (seamless in-place resume). The
@@ -4049,3 +4057,31 @@ test("re-login with new credentials clears stale authFailures for transient-cool
 		"after re-login, a single 401 must not invalidate — stale same-key counter was cleared",
 	);
 });
+
+for (const [provider, thinking] of [
+	["openai-codex", "high"],
+	["anthropic", "medium"],
+	["openai-codex", "max"],
+] as const) {
+	test(`TASK-45 pre-turn ${provider} switch preserves selected ${thinking}`, async () => {
+		const accounts = {
+			[provider]: { type: "oauth", access: "fixture-primary", refresh: "fixture-refresh1" },
+			"openai-codex-account-2": { type: "oauth", access: "fixture-account2", refresh: "fixture-refresh2", accountId: "fixture2" },
+		};
+		const t = setup({
+			accounts, current: { provider, id: provider === "anthropic" ? "claude-opus-4-8" : "gpt-6.1-sol" },
+			thinking, modelThinkingDefault: "max", hostCodexModels: ["gpt-6.1-sol"],
+			seedCooldownsMsFromNow: { [provider]: 60_000 },
+			config: { autoContinue: false, autoDiscover: false, fallbacks: ["openai-codex-account-2/gpt-6.1-sol"] },
+		});
+		try {
+			// No agent_start: this is the startup boundary measured on the real SDK.
+			await t.fire("session_start");
+			assert.equal(t.ctx.model.provider, "openai-codex-account-2");
+			assert.equal(t.rec.thinkingLevels.at(-1), thinking);
+			assert.equal(t.readState().lastSwitches[0]?.reason, "startup preflight: selected account unavailable");
+		} finally {
+			await t.fire("session_shutdown");
+		}
+	});
+}
