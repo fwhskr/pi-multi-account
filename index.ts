@@ -1465,9 +1465,170 @@ function parseTarget(
 // Model definitions for registered alias providers
 // ---------------------------------------------------------------------------
 
-function anthropicModelDef(id: string, providerId: string) {
-	const canonical = piAiGetModel("anthropic", id) as any;
+/**
+ * TASK-143: snapshot of one host-registry Anthropic model, captured at alias
+ * registration time so the alias def keeps the live catalog's window and
+ * thinking map even when the bundled pi-ai lookup goes stale later.
+ */
+export type AnthropicCost = { input: number; output: number; cacheRead: number; cacheWrite: number };
+
+export type HostAnthropicSnapshot = {
+	id: string;
+	contextWindow?: number;
+	maxTokens?: number;
+	thinkingLevelMap?: Record<string, string | null>;
+	reasoning?: boolean;
+	input?: Array<"text" | "image">;
+	cost?: AnthropicCost;
+	name?: string;
+	api?: string;
+	baseUrl?: string;
+};
+
+/**
+ * TASK-143: capture the fields an alias def must mirror from the host registry.
+ * Unknown shapes stay undefined so the caller falls through to the next source.
+ */
+export function snapshotHostAnthropicModel(model: {
+	id: string;
+	contextWindow?: unknown;
+	maxTokens?: unknown;
+	thinkingLevelMap?: unknown;
+	reasoning?: unknown;
+	input?: unknown;
+	cost?: unknown;
+	name?: unknown;
+	api?: unknown;
+	baseUrl?: unknown;
+} | null | undefined): HostAnthropicSnapshot | undefined {
+	if (!model || typeof model?.id !== "string") return undefined;
+	const cost =
+		model.cost && typeof model.cost === "object" && !Array.isArray(model.cost)
+			? (model.cost as Partial<AnthropicCost>)
+			: undefined;
+	const fullCost =
+		typeof cost?.input === "number" &&
+		typeof cost?.output === "number" &&
+		typeof cost?.cacheRead === "number" &&
+		typeof cost?.cacheWrite === "number"
+			? {
+					input: cost.input as number,
+					output: cost.output as number,
+					cacheRead: cost.cacheRead as number,
+					cacheWrite: cost.cacheWrite as number,
+				}
+			: undefined;
+	const thinking =
+		model.thinkingLevelMap && typeof model.thinkingLevelMap === "object" && !Array.isArray(model.thinkingLevelMap)
+			? (model.thinkingLevelMap as Record<string, string | null>)
+			: undefined;
+	const input =
+		Array.isArray(model.input) &&
+		model.input.length > 0 &&
+		model.input.every((entry): entry is "text" | "image" => entry === "text" || entry === "image")
+			? [...model.input]
+			: undefined;
+	return {
+		id: model.id,
+		...(typeof model.contextWindow === "number" ? { contextWindow: model.contextWindow } : {}),
+		...(typeof model.maxTokens === "number" ? { maxTokens: model.maxTokens } : {}),
+		...(thinking ? { thinkingLevelMap: { ...thinking } } : {}),
+		...(typeof model.reasoning === "boolean" ? { reasoning: model.reasoning } : {}),
+		...(input ? { input } : {}),
+		...(fullCost ? { cost: fullCost } : {}),
+		...(typeof model.name === "string" ? { name: model.name } : {}),
+		...(typeof model.api === "string" ? { api: model.api } : {}),
+		...(typeof model.baseUrl === "string" ? { baseUrl: model.baseUrl } : {}),
+	};
+}
+
+/**
+ * TASK-143: generic-shape defaults every alias-def layer starts from. Kept
+ * separate so the host-snapshot layer only has to override what it knows.
+ */
+function hostAnthropicDefaults(id: string, providerId: string) {
+	return {
+		id,
+		name: id,
+		api: "anthropic-messages",
+		provider: providerId,
+		baseUrl: "https://api.anthropic.com",
+		reasoning: true,
+		input: ["text", "image"] as Array<"text" | "image">,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 200000,
+		maxTokens: 32000,
+	};
+}
+
+/**
+ * TASK-143: snapshot every Anthropic model the live host registry publishes.
+ * Called at alias registration time so the alias defs mirror the same catalog
+ * the base provider serves, even when the bundled pi-ai copy is stale.
+ * `lookup` defaults to the host model registry; tests inject a fixture.
+ */
+export function snapshotAnthropicHostModels(
+	getAll?: () => unknown,
+	find?: (provider: string, id: string) => unknown,
+): Map<string, HostAnthropicSnapshot> {
+	const out = new Map<string, HostAnthropicSnapshot>();
+	let models: unknown[] = [];
+	try {
+		const listed = getAll?.();
+		if (Array.isArray(listed)) models = listed;
+	} catch {
+		return out;
+	}
+	for (const model of models) {
+		const snap = snapshotHostAnthropicModel(
+			model as Parameters<typeof snapshotHostAnthropicModel>[0],
+		);
+		if (snap) out.set(snap.id, snap);
+	}
+	// Fill gaps for ids the listing missed but the registry can serve directly.
+	if (find) {
+		for (const id of DEFAULT_ANTHROPIC_MODELS) {
+			if (out.has(id)) continue;
+			let direct: unknown;
+			try {
+				direct = find(ANTHROPIC_BASE, id);
+			} catch {
+				continue;
+			}
+			const snap = snapshotHostAnthropicModel(
+				direct as Parameters<typeof snapshotHostAnthropicModel>[0],
+			);
+			if (snap) out.set(snap.id, snap);
+		}
+	}
+	return out;
+}
+
+/**
+ * TASK-143: alias def resolution order — host registry snapshot first, then the
+ * bundled pi-ai catalog, then the base provider copy. The generic 200K fallback
+ * (no thinking map) is last and only for ids nothing else knows. Every layer
+ * keeps the alias provider id.
+ */
+export function anthropicModelDef(
+	id: string,
+	providerId: string,
+	sources: {
+		host?: HostAnthropicSnapshot;
+		catalog?: Record<string, unknown> | null;
+		base?: Record<string, unknown> | null;
+	} = {},
+) {
+	// Host registry snapshot wins: it is the same source the base provider uses,
+	// so the alias mirrors the live catalog even when the bundled pi-ai is stale.
+	if (sources.host) return { ...hostAnthropicDefaults(id, providerId), ...sources.host, provider: providerId };
+	// Bundled pi-ai catalog next — still authoritative for ids the running host
+	// registry has not published yet.
+	const canonical =
+		sources.catalog !== undefined ? sources.catalog : piAiGetModel("anthropic", id);
 	if (canonical) return { ...canonical, provider: providerId };
+	// Unknown model id: copy the base provider shape instead of inventing one.
+	if (sources.base) return { ...sources.base, id, provider: providerId };
 	return {
 		id,
 		name: id,
@@ -1528,9 +1689,27 @@ function registerAnthropicSlot(
 	pi: ExtensionAPI,
 	id: string,
 	modelIds: string[] = DEFAULT_ANTHROPIC_MODELS,
+	hostRegistry?: { getAll?: () => unknown; find?: (provider: string, id: string) => unknown },
 ) {
 	if (id === ANTHROPIC_BASE) return; // base provider: oauth + shaping registered in piMultiAccount()
-	const models = modelIds.map((m) => anthropicModelDef(m, id));
+	// Snapshot the live catalog once per registration: every alias id reads the
+	// host registry first (same source the base provider uses), so a stale
+	// bundled pi-ai can never shrink the alias window or drop its thinking map.
+	// Ids the host registry does not publish fall back to the bundled pi-ai
+	// catalog inside anthropicModelDef — still authoritative for ids the running
+	// host has not published yet.
+	const listAnthropic = hostRegistry?.getAll
+		? () => {
+					const listed = hostRegistry.getAll?.();
+					return Array.isArray(listed)
+						? listed.filter(
+									(model) => (model as { provider?: unknown })?.provider === ANTHROPIC_BASE,
+								)
+						: [];
+				}
+		: undefined;
+	const hostSnapshots = snapshotAnthropicHostModels(listAnthropic, hostRegistry?.find?.bind(hostRegistry));
+	const models = modelIds.map((m) => anthropicModelDef(m, id, { host: hostSnapshots.get(m) }));
 	pi.registerProvider(id, {
 		name: `Claude Pro/Max (${id})`,
 		baseUrl: "https://api.anthropic.com",
@@ -2126,7 +2305,7 @@ function normalizeSystemBlock(block: unknown): ShapeTextBlock {
 function prependBillingHeader(
 	system: unknown,
 	messages: ShapeMessageParam[],
-): unknown {
+): unknown[] | unknown {
 	const billingHeader = buildBillingHeaderValue(messages);
 	if (!billingHeader) return system;
 	const systemBlocks = Array.isArray(system)
@@ -2224,7 +2403,7 @@ function shapeSystemBlocks(blocks: ShapeTextBlock[]): ShapeTextBlock[] {
 }
 
 /** before_provider_request shaper: makes Claude Pro/Max OAuth requests acceptable. */
-function shapeAnthropicOAuthPayload(payload: unknown): unknown {
+function shapeAnthropicOAuthPayload(payload: unknown): ShapeAnthropicPayload | unknown {
 	if (!isAnthropicMessagesPayload(payload)) return payload;
 	const messages = payload.messages as ShapeMessageParam[];
 	if (!isOAuthAnthropicPayload(payload)) return payload; // API-key / non-OAuth → untouched
@@ -2900,10 +3079,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		if (ranked.join(",") === registryAnthropicModelOrder.join(",")) return;
 		registryAnthropicModelOrder = ranked;
 		// Alias slots are registered from the static list, so a model only the host knows about
-		// would not be selectable on them even once it is ranked first.
+		// would not be selectable on them even once it is ranked first. Pass the live
+		// registry through so each alias def mirrors the host catalog (TASK-143).
 		for (const provider of registeredSlots) {
 			if (classifyProvider(provider, config.qwenProvider) !== "anthropic") continue;
-			registerAnthropicSlot(pi, provider, ranked);
+			registerAnthropicSlot(pi, provider, ranked, ctx?.modelRegistry);
 		}
 	}
 
@@ -3777,7 +3957,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	}
 
 	/** Register authed alias slots plus one spare per family for the next interactive /login. */
-	function syncRegisteredSlots(auth: Record<string, AuthEntry>) {
+	function syncRegisteredSlots(auth: Record<string, AuthEntry>, ctx?: any) {
 		// Cursor is the one family whose provider lives in a separate, optional repo. Unlike
 		// anthropic/codex/qwen/ollama — which only ever create slots backed by a real auth
 		// entry — cursor used to conjure a spare `cursor-account-2` out of nothing, so /login
@@ -3823,7 +4003,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				}
 				if (index <= 1) continue; // base provider is native
 				if (registeredSlots.has(id)) continue;
-				if (family === "anthropic") registerAnthropicSlot(pi, id);
+				// Anthropic aliases mirror the live host catalog at registration (TASK-143).
+				if (family === "anthropic") registerAnthropicSlot(pi, id, undefined, ctx?.modelRegistry);
 				else if (family === "openai-codex") registerCodexSlot(pi, id);
 				else if (family === "ollama") registerApiKeySlot(pi, id, "ollama");
 				else if (family === "qwen") registerApiKeySlot(pi, id, "qwen");
@@ -3904,7 +4085,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		}
 		if (cooldownsCleared) persist();
 		clearReauthedInvalidations(auth);
-		syncRegisteredSlots(auth);
+		syncRegisteredSlots(auth, ctx);
 		// After the slots exist: learn the host's Codex model list, so a flagship that shipped
 		// with Pi (and not with this extension) is selectable and preferred on every slot.
 		if (ctx) {
@@ -5470,7 +5651,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				await refreshCursorSlots(auth, ctx, true);
 				return;
 			}
-			syncRegisteredSlots(auth);
+			syncRegisteredSlots(auth, ctx);
 			if (
 				family === "anthropic" ||
 				family === "openai-codex" ||
@@ -5960,8 +6141,12 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// for instant diagnosis) and, ONCE per process, tell the user in plain terms if switching is
 	// impossible or resume is degraded — instead of letting them discover it under fire.
 	function preflightHostCapabilities(ctx: any) {
-		const has = (name: string) =>
-			typeof (pi as unknown as Record<string, unknown>)[name] === "function";
+		const has = (name: string) => {
+			// SAFETY: Pi's extension host object is untyped at runtime; the string
+			// index only probes for callable capabilities and never mutates the host.
+			const caps = pi as unknown as Record<string, unknown>;
+			return typeof caps[name] === "function";
+		};
 		const caps = {
 			setModel: has("setModel"), // switch accounts at all
 			registerProvider: has("registerProvider"), // register extra account slots

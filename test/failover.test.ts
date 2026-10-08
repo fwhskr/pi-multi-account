@@ -129,6 +129,8 @@ function setup(opts: {
 	omitSendUserMessage?: boolean;
 	/** Models the HOST (Pi) itself publishes for the base Codex provider. */
 	hostCodexModels?: string[];
+	/** TASK-143: full host-registry Anthropic model defs the live catalog serves. */
+	hostAnthropicModels?: Array<Record<string, unknown>>;
 	/** TASK-45: opt into the real host's mutable effort/model-default semantics. */
 	thinking?: string;
 	modelThinkingDefault?: string;
@@ -215,6 +217,13 @@ function setup(opts: {
 				[...known].flatMap((provider) => {
 					if (opts.hostCodexModels && provider === "openai-codex") {
 						return opts.hostCodexModels.map((id) => mkModel(provider, id));
+					}
+					// TASK-143: the live catalog the host serves for the base provider.
+					if (opts.hostAnthropicModels && provider === "anthropic") {
+						return opts.hostAnthropicModels.map((model) => ({
+							...model,
+							provider,
+						}));
 					}
 					return (
 						registeredModels.get(provider) ?? [
