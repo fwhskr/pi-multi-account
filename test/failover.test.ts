@@ -4230,3 +4230,154 @@ test("TASK-173: an automatic resume that has waited longer than the cap stops wi
 		`a terminal notice naming the horizon is required; notifies=${JSON.stringify(t.rec.notifies)}`,
 	);
 });
+
+// TASK-173 (Echo ECHO-3d): a declared-chain agent that keeps hitting limits on both
+// same-family accounts must never be held by a package pending-continuation.
+test("TASK-173: a declared-chain agent is never held by a pending-continuation across repeated limits", async () => {
+	const agentsDir = join(AGENT_DIR, "agents");
+	mkdirSync(agentsDir, { recursive: true });
+	const profilePath = join(agentsDir, "task173loop.md");
+	writeFileSync(
+		profilePath,
+		["---", "model: anthropic/claude-opus-4-8", "fallbacks:", "  - provider: opencode-go", "    model: muse-spark-1.3-contributor", "---", "", "body", ""].join("\n"),
+	);
+	const previousAgent = process.env.SULA_DESKTOP_AGENT;
+	process.env.SULA_DESKTOP_AGENT = "task173loop";
+	try {
+		const t = setup({
+			accounts: {
+				anthropic: { type: "oauth", access: "a", refresh: "ar" },
+				"anthropic-account-2": { type: "oauth", access: "b", refresh: "br" },
+			},
+			config: { ...TASK173_CONFIG, fallbacks: ["opencode-go/muse-spark-1.3-contributor"] },
+			current: { provider: "anthropic", id: "claude-opus-4-8" },
+			idle: false,
+		});
+		await t.fire("agent_start");
+		const seq: Array<[string, string]> = [
+			["anthropic", "claude-opus-4-8"],
+			["anthropic-account-2", "claude-opus-5"],
+			["anthropic-account-2", "claude-opus-5"],
+			["anthropic", "claude-opus-4-8"],
+			["anthropic-account-2", "claude-opus-5"],
+			["anthropic", "claude-opus-4-8"],
+		];
+		for (const [provider, model] of seq) {
+			await finishError(t, provider, model, TASK173_RATE_BODY);
+			assert.equal(
+				t.readState().pendingReason,
+				undefined,
+				`declared-chain agent held after ${provider}/${model}`,
+			);
+		}
+		assert.ok(!t.rec.setModels.some((model) => model.startsWith("opencode-go/")));
+	} finally {
+		if (previousAgent === undefined) delete process.env.SULA_DESKTOP_AGENT;
+		else process.env.SULA_DESKTOP_AGENT = previousAgent;
+		rmSync(profilePath, { force: true });
+	}
+});
+
+test("TASK-173: an agent WITHOUT a declared chain still gets the pending-continuation hold on repeated limits", async () => {
+	const previousAgent = process.env.SULA_DESKTOP_AGENT;
+	delete process.env.SULA_DESKTOP_AGENT;
+	try {
+		const t = setup({
+			accounts: {
+				anthropic: { type: "oauth", access: "a", refresh: "ar" },
+				"anthropic-account-2": { type: "oauth", access: "b", refresh: "br" },
+			},
+			config: TASK173_CONFIG,
+			current: { provider: "anthropic", id: "claude-opus-4-8" },
+			idle: false,
+		});
+		await t.fire("agent_start");
+		await finishError(t, "anthropic", "claude-opus-4-8", TASK173_RATE_BODY);
+		await finishError(t, "anthropic-account-2", "claude-opus-5", TASK173_RATE_BODY);
+		assert.ok(t.readState().pendingReason, "no declared chain: the package hold must remain");
+	} finally {
+		if (previousAgent !== undefined) process.env.SULA_DESKTOP_AGENT = previousAgent;
+	}
+});
+
+// TASK-173: a malformed or far-future reset header must not lock an account for the 6h ceiling.
+test("TASK-173: a '9999' reset header (Date.parse year 9999) does not lock the account; it gets the floor", async () => {
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+			"anthropic-account-2": { type: "oauth", access: "b", refresh: "br" },
+		},
+		config: TASK173_CONFIG,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		idle: false,
+	});
+	await t.fire("agent_start");
+	await t.fire("after_provider_response", {
+		status: 429,
+		headers: { "anthropic-ratelimit-input-tokens-reset": "9999" },
+	});
+	const before = Date.now();
+	await finishError(t, "anthropic", "claude-opus-4-8", TASK173_RATE_BODY);
+	const remainingMs = (t.readState().exhaustedUntilByProvider?.anthropic ?? 0) - before;
+	assert.ok(remainingMs >= 55_000 && remainingMs <= 65_000, `bogus reset must fall to the 60s floor, got ${remainingMs}ms`);
+});
+
+test("TASK-173: an implausibly far-future ISO reset header (2h ahead) is ignored; the 60s floor applies", async () => {
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+			"anthropic-account-2": { type: "oauth", access: "b", refresh: "br" },
+		},
+		config: TASK173_CONFIG,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		idle: false,
+	});
+	await t.fire("agent_start");
+	await t.fire("after_provider_response", {
+		status: 429,
+		headers: { "anthropic-ratelimit-requests-reset": new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString() },
+	});
+	const before = Date.now();
+	await finishError(t, "anthropic", "claude-opus-4-8", TASK173_RATE_BODY);
+	const remainingMs = (t.readState().exhaustedUntilByProvider?.anthropic ?? 0) - before;
+	assert.ok(remainingMs >= 55_000 && remainingMs <= 65_000, `2h-ahead reset must be ignored, got ${remainingMs}ms`);
+});
+
+test("TASK-173: a past Anthropic reset header gives no header cooldown; the 60s floor applies", async () => {
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+			"anthropic-account-2": { type: "oauth", access: "b", refresh: "br" },
+		},
+		config: TASK173_CONFIG,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		idle: false,
+	});
+	await t.fire("agent_start");
+	await t.fire("after_provider_response", {
+		status: 429,
+		headers: { "anthropic-ratelimit-input-tokens-reset": new Date(Date.now() - 120_000).toISOString() },
+	});
+	const before = Date.now();
+	await finishError(t, "anthropic", "claude-opus-4-8", TASK173_RATE_BODY);
+	const remainingMs = (t.readState().exhaustedUntilByProvider?.anthropic ?? 0) - before;
+	assert.ok(remainingMs >= 55_000 && remainingMs <= 65_000, `past reset must give the floor, got ${remainingMs}ms`);
+});
+
+test("TASK-173: a genuine retry-after in seconds is unchanged by the header bound", async () => {
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+			"anthropic-account-2": { type: "oauth", access: "b", refresh: "br" },
+		},
+		config: TASK173_CONFIG,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		idle: false,
+	});
+	await t.fire("agent_start");
+	await t.fire("after_provider_response", { status: 429, headers: { "retry-after": "120" } });
+	const before = Date.now();
+	await finishError(t, "anthropic", "claude-opus-4-8", TASK173_RATE_BODY);
+	const remainingMs = (t.readState().exhaustedUntilByProvider?.anthropic ?? 0) - before;
+	assert.ok(remainingMs >= 115_000 && remainingMs <= 121_000, `retry-after 120s must stay 120s, got ${remainingMs}ms`);
+});

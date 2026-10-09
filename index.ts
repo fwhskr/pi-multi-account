@@ -603,6 +603,8 @@ const TRANSIENT_PENDING_PREFIX = "temporary provider failure:";
 // a failure of the current model (doing so would downgrade it to an older sibling on the same
 // account, which shares the same quota pool and gains nothing).
 const BUSY_RETRY_REASON = "previous turn was still busy; auto-retry";
+const WATCHDOG_RECOVERY_REASON =
+	"auto-recovered a stuck resume; waiting for an account to free up";
 // Raised from 3 → 8. A single transient 401 burst from OpenAI Codex (one physical event
 // that Pi surfaces as 3 error hooks: response/message/agent) hit the old threshold instantly
 // and permanently killed a live account. The threshold now tolerates a retry burst plus a
@@ -1945,7 +1947,7 @@ function retryAfterToMs(value: string | undefined) {
 	if (Number.isFinite(seconds) && seconds >= 0)
 		return Math.ceil(seconds * 1000);
 	const dateMs = Date.parse(value);
-	if (Number.isFinite(dateMs)) return Math.max(0, dateMs - Date.now());
+	if (Number.isFinite(dateMs)) return rfc3339ToCooldownMs(value);
 	return undefined;
 }
 
@@ -1977,10 +1979,18 @@ function percentValue(value: string | undefined) {
 	return Number.isFinite(numeric) ? numeric : undefined;
 }
 
+// TASK-173: an Anthropic reset header is a per-bucket window that clears within minutes. Any
+// absolute reset further out is malformed (Date.parse("9999") is year 9999) and is ignored, so the
+// account falls to the per-minute floor instead of a 6h lock. A past reset yields 0 (no cooldown).
+const MAX_HEADER_RESET_AHEAD_MS = 30 * 60 * 1000;
+
 function rfc3339ToCooldownMs(value: string | undefined) {
 	if (!value) return undefined;
 	const at = Date.parse(value);
-	return Number.isFinite(at) ? Math.max(0, at - Date.now()) : undefined;
+	if (!Number.isFinite(at)) return undefined;
+	const ahead = at - Date.now();
+	if (ahead > MAX_HEADER_RESET_AHEAD_MS) return undefined;
+	return Math.max(0, ahead);
 }
 
 const ANTHROPIC_RESET_HEADERS = [
@@ -4569,7 +4579,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				`Provider failover: no immediately available fallback after ${failedModel.provider}/${failedModel.id}. ${availability || "All known accounts may be unauthenticated, invalidated, or duplicate slots."}`,
 				"warning",
 			);
-			if (!options.manual && config.autoContinue && !sessionAgentHasDeclaredFallbackChain(ctx))
+					if (!options.manual && config.autoContinue)
 				setPendingContinuation(ctx, failedModel, reason);
 			return false;
 		}
@@ -4583,12 +4593,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		);
 		// TASK-173: a declared-chain agent's profile chain owns the wait and the hand-off to its
 		// next target once every same-family account is limited; the package must not hold the pane.
-		if (
-			!switched &&
-			!options.manual &&
-			config.autoContinue &&
-			!sessionAgentHasDeclaredFallbackChain(ctx)
-		) {
+		if (!switched && !options.manual && config.autoContinue) {
 			if (!armSameAccountResumeIfReady(ctx, failedModel, reason, options))
 				setPendingContinuation(ctx, failedModel, reason);
 		}
@@ -5335,6 +5340,16 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	}
 
 	function setPendingContinuation(ctx: any, failedModel: any, reason: string) {
+		// TASK-173: a declared-chain agent's profile chain owns the wait for account limits and the
+		// hand-off, so the package never holds the pane for them. Same-account retries (a busy turn,
+		// a transient server error, a watchdog recovery) keep the hold: the chain has no step for them.
+		if (
+			sessionAgentHasDeclaredFallbackChain(ctx) &&
+			!isTransientPendingReason(reason) &&
+			!isBusyRetryPendingReason(reason) &&
+			reason !== WATCHDOG_RECOVERY_REASON
+		)
+			return;
 		const from = ref(failedModel.provider, failedModel.id);
 		const alreadyPending = hasPendingResume();
 		persistedState = {
@@ -6676,11 +6691,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			currentPromptSwitch = undefined;
 			continuationDispatchedForAgentTurn = false;
 			if (failed && config.enabled && config.autoContinue) {
-				setPendingContinuation(
-					ctx,
-					failed,
-					"auto-recovered a stuck resume; waiting for an account to free up",
-				);
+				setPendingContinuation(ctx, failed, WATCHDOG_RECOVERY_REASON);
 			}
 			return;
 		}
