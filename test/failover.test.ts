@@ -1901,18 +1901,23 @@ test("Esc abort stops the chain and clears pending resume", async () => {
 	);
 });
 
-test("all-limited work resumes in the same live session after cooldown", async () => {
+test("all-limited work resumes in the same live session after cooldown", async (tc) => {
+	tc.mock.timers.enable({ apis: ["Date", "setTimeout"] });
 	const t = setup({
 		accounts: ONE_ACCOUNT,
 		current: { provider: "anthropic", id: "claude-opus-4-8" },
 		config: { cooldownMs: 1000, probeCooldownMs: 1000 },
 	});
-	// The provider states a 1s reset, so the hint (not the default window) sets the wait.
+	// A 1s relative hint is floored to 60s; resume only when that floor expires.
 	await t.fire("after_provider_response", { status: 429, headers: { "retry-after": "1" } });
 	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate limit");
 	assert.equal(t.rec.sent.length, 0, "nothing is available immediately");
 	assert.ok(t.readState().pendingFrom && t.readState().pendingReason);
-	await new Promise((resolve) => setTimeout(resolve, 1200));
+	tc.mock.timers.tick(59_000);
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.equal(t.rec.continueCalls.length, 0, "must not resume below the 60s floor");
+	tc.mock.timers.tick(2000);
+	await new Promise<void>((resolve) => setImmediate(resolve));
 	assert.equal(
 		t.rec.continueCalls.length,
 		1,
@@ -4299,6 +4304,41 @@ test("TASK-173: an agent WITHOUT a declared chain still gets the pending-continu
 		if (previousAgent !== undefined) process.env.SULA_DESKTOP_AGENT = previousAgent;
 	}
 });
+
+test("TASK-173 D2: fresh free usage cannot clear streak 7 after 31 minutes", async (tc) => {
+ const start = Date.parse("2026-10-09T14:00:00Z");
+ const clock = withFakeClock(tc, start);
+ const t = setup({
+  accounts: { anthropic: { type: "oauth", access: "a", refresh: "ar" }, "anthropic-account-2": { type: "oauth", access: "b", refresh: "br" } },
+  config: TASK173_CONFIG, current: { provider: "anthropic", id: "claude-opus-4-8" }, idle: false,
+  seedState: { stateVersion: 5, exhaustedUntilByProvider: {}, exhaustedUntilByModel: {}, lastProbeAtByProvider: {}, invalidatedByProvider: {}, lastSwitches: [], usageByProvider: { anthropic: { provider: "anthropic", family: "anthropic", fetchedAt: start + 6 * 3600_000, primary: { usedPercent: 1, resetAt: start + 3 * 3600_000 } } } },
+ });
+ let lastAt = start;
+ for (let i = 0; i < 7; i++) {
+  t.setCurrent("anthropic", "claude-opus-4-8");
+  lastAt = clock.now();
+  await finishError(t, "anthropic", "claude-opus-4-8", TASK173_RATE_BODY);
+  if (i > 0) assert.equal(remainingFor(t, "anthropic", clock.now()), Math.min(60_000 * 2 ** i, 3600_000));
+  clock.advance(Math.max(remainingFor(t, "anthropic", clock.now()), 0) + 1000);
+ }
+ clock.advance(lastAt + 31 * 60_000 - clock.now());
+ await t.command("status");
+ assert.equal(remainingFor(t, "anthropic", clock.now()), 29 * 60_000);
+ assert.ok(!t.rec.notifies.at(-1)?.includes("all rotation accounts available now"));
+});
+for (const [label, headers, expected] of [
+ ["retry-after 5", { "retry-after": "5" }, 60_000],
+ ["retry-after 90000", { "retry-after": "90000" }, 3600_000],
+ ["past reset with retry-after 5", { "anthropic-ratelimit-input-tokens-reset": "2026-10-09T13:59:00Z", "retry-after": "5" }, 60_000],
+] as const) {
+ test(`TASK-173 D3: ${label} is bounded`, async (tc) => {
+  const clock = withFakeClock(tc, Date.parse("2026-10-09T14:00:00Z"));
+  const t = twoAnthropicAccounts();
+  await t.fire("after_provider_response", { status: 429, headers });
+  await finishError(t, "anthropic", "claude-opus-4-8", TASK173_RATE_BODY);
+  assert.equal(remainingFor(t, "anthropic", clock.now()), expected);
+ });
+}
 
 // TASK-173b: the refusal streak is the escalation input for a provider that keeps refusing with
 // no reset hint. It must survive quiet time (no decay), escalate the probe wait, clear on a real

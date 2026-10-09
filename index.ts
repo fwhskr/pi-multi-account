@@ -2583,7 +2583,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	const catalogAuthFailures = new Map<string, number>();
 	// Response headers arrive before the final assistant message. Keep their cooldown hints, but
 	// never switch accounts from that early hook: Pi may still be retrying the same HTTP request.
-	const responseCooldownHints = new Map<string, number>();
+	const responseCooldownHints = new Map<string, { ms: number; absoluteReset?: number }>();
 	const handledAssistantErrors = new Set<string>();
 	// Consecutive limit-error accounting per provider (in-memory, reset on any success). Two limit
 	// errors in a row prove the usage-% window is not seeing this account's real limit, so usage is
@@ -3693,10 +3693,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	}
 
 	/** When does this provider become usable again? Uses recorded cooldown AND fresh usage. */
-	// True while a provider's usage-% reading is distrusted because a repeat limit error proved it
-	// does not reflect the account's real (session/rate) limit. See LIMIT_STREAK_WINDOW_MS.
+	// Repeated refusals prove usage cannot see this rate limit. Elapsed time is not recovery.
 	function usageUntrusted(provider: string, now = Date.now()): boolean {
-		return (usageUntrustedUntilByProvider.get(provider) ?? 0) > now;
+		return (limitStreakByProvider.get(provider)?.count ?? 0) >= 2 ||
+			(usageUntrustedUntilByProvider.get(provider) ?? 0) > now;
 	}
 
 	// Record a limit error for a provider and return the consecutive streak. TASK-173b: the streak does
@@ -3782,10 +3782,14 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		errorText: string,
 	): Promise<number> {
 		const now = Date.now();
-		// Count this limit error. A repeat within the streak window flips usage to "distrusted".
+		// Count consecutive refusals, independent of elapsed time.
 		const streak = noteLimitError(provider, now);
+		const responseHint = responseCooldownHints.get(provider);
+		// A plausible absolute server reset wins over escalation, but remains floored/capped.
+		if (responseHint?.absoluteReset !== undefined)
+			return Math.min(Math.max(responseHint.absoluteReset, LIMIT_MIN_COOLDOWN_MS), LIMIT_MAX_PROBE_MS);
 		const hintedCooldowns = [
-			responseCooldownHints.get(provider),
+			responseHint?.ms,
 			cooldownFromErrorText(errorText),
 		].filter(
 			(value): value is number => typeof value === "number" && value > 0,
@@ -3801,7 +3805,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			// account has limit-errored twice in a row while usage claimed "free", we stop believing
 			// the 0 and record a real floor cooldown instead of returning 0 and hot-looping a retry.
 			if (usageMs === 0) {
-				if (streak < 2) return 0;
+				if (streak < 2 && hintedCooldowns.length === 0) return LIMIT_MIN_COOLDOWN_MS;
 			} else if (usageMs !== undefined && usageMs > 0) {
 				hintedCooldowns.push(usageMs);
 			}
@@ -3814,8 +3818,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				Math.max(config.cooldownMs, limitStreakFloorMs(streak)),
 				LIMIT_MAX_PROBE_MS,
 			);
-		// Backstop: never let a single live estimate lock an account beyond the ceiling.
-		return Math.min(Math.max(...hintedCooldowns), MAX_LIVE_COOLDOWN_MS);
+		// Relative hints and usage never weaken the streak floor or exceed the 429 probe cap.
+		return Math.min(Math.max(...hintedCooldowns, limitStreakFloorMs(streak)), LIMIT_MAX_PROBE_MS);
 	}
 
 	function providersSharingAccount(provider: string): string[] {
@@ -6536,15 +6540,18 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 					/* diagnostics only; never affects failover */
 				}
 			}
-			const cooldownMs = cooldownFromHeaders((event as any).headers ?? {});
-			if (cooldownMs !== undefined) {
-				responseCooldownHints.set(
-					ctx.model.provider,
-					Math.max(
-						responseCooldownHints.get(ctx.model.provider) ?? 0,
-						cooldownMs,
-					),
-				);
+			const headers = (event as any).headers ?? {};
+			const cooldownMs = cooldownFromHeaders(headers);
+			const absoluteResets = Object.entries(headers as Record<string, string>)
+				.filter(([name]) => ANTHROPIC_RESET_HEADERS.includes(name.toLowerCase()))
+				.map(([, value]) => rfc3339ToCooldownMs(value))
+				.filter((value): value is number => value !== undefined);
+			if (cooldownMs !== undefined || absoluteResets.length > 0) {
+				const previous = responseCooldownHints.get(ctx.model.provider);
+				responseCooldownHints.set(ctx.model.provider, {
+					ms: Math.max(previous?.ms ?? 0, cooldownMs ?? 0),
+					absoluteReset: absoluteResets.length > 0 ? Math.max(...absoluteResets) : previous?.absoluteReset,
+				});
 			}
 		}
 	});
