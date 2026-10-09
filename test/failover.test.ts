@@ -1907,6 +1907,8 @@ test("all-limited work resumes in the same live session after cooldown", async (
 		current: { provider: "anthropic", id: "claude-opus-4-8" },
 		config: { cooldownMs: 1000, probeCooldownMs: 1000 },
 	});
+	// The provider states a 1s reset, so the hint (not the default window) sets the wait.
+	await t.fire("after_provider_response", { status: 429, headers: { "retry-after": "1" } });
 	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate limit");
 	assert.equal(t.rec.sent.length, 0, "nothing is available immediately");
 	assert.ok(t.readState().pendingFrom && t.readState().pendingReason);
@@ -4094,3 +4096,137 @@ for (const [provider, thinking] of [
 		}
 	});
 }
+
+// TASK-173: a resumed Anthropic session hit a 429 on both accounts. The owner
+// config cooldownMs (3000) let each account re-probe after ~3s, so the session
+// flipped between accounts and died within the core retry budget.
+const TASK173_CONFIG = {
+	cooldownMs: 3000,
+	probeCooldownMs: 3000,
+	transientCooldownMs: 3000,
+};
+const TASK173_RATE_BODY =
+	'429 {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your account\'s rate limit. Please try again later."}}';
+
+test("TASK-173: a 429 with Anthropic reset headers cools the account until the reset, not 3s", async () => {
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+			"anthropic-account-2": { type: "oauth", access: "b", refresh: "br" },
+		},
+		config: TASK173_CONFIG,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		idle: false,
+	});
+	const reset = new Date(Date.now() + 90_000).toISOString();
+	await t.fire("agent_start");
+	await t.fire("after_provider_response", {
+		status: 429,
+		headers: { "anthropic-ratelimit-input-tokens-reset": reset },
+	});
+	const before = Date.now();
+	await finishError(t, "anthropic", "claude-opus-4-8", TASK173_RATE_BODY);
+	const remainingMs = (t.readState().exhaustedUntilByProvider?.anthropic ?? 0) - before;
+	assert.ok(
+		remainingMs >= 80_000,
+		`anthropic must stay cooling until its reset (~90s), got ${remainingMs}ms`,
+	);
+	assert.deepEqual(t.rec.setModels, ["anthropic-account-2/claude-opus-5"]);
+});
+
+test("TASK-173: a 429 with no reset hint still cools for a per-minute-scale window", async () => {
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+			"anthropic-account-2": { type: "oauth", access: "b", refresh: "br" },
+		},
+		config: TASK173_CONFIG,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		idle: false,
+	});
+	const before = Date.now();
+	await finishError(t, "anthropic", "claude-opus-4-8", TASK173_RATE_BODY);
+	const remainingMs = (t.readState().exhaustedUntilByProvider?.anthropic ?? 0) - before;
+	assert.ok(
+		remainingMs >= 55_000,
+		`a bare 429 must not re-probe in ~3s; cooldown was ${remainingMs}ms`,
+	);
+});
+
+test("TASK-173: a declared-chain agent with every same-family account limited hands off to its chain instead of pausing the package", async () => {
+	const agentsDir = join(AGENT_DIR, "agents");
+	mkdirSync(agentsDir, { recursive: true });
+	const profilePath = join(agentsDir, "task173artist.md");
+	writeFileSync(
+		profilePath,
+		[
+			"---",
+			"model: anthropic/claude-opus-4-8",
+			"thinking: low",
+			"fallbacks:",
+			"  - provider: opencode-go",
+			"    model: muse-spark-1.3-contributor",
+			"    thinking: xhigh",
+			"---",
+			"",
+			"body",
+			"",
+		].join("\n"),
+	);
+	const previousAgent = process.env.SULA_DESKTOP_AGENT;
+	process.env.SULA_DESKTOP_AGENT = "task173artist";
+	try {
+		const t = setup({
+			accounts: {
+				anthropic: { type: "oauth", access: "a", refresh: "ar" },
+				"anthropic-account-2": { type: "oauth", access: "b", refresh: "br" },
+			},
+			config: { ...TASK173_CONFIG, fallbacks: ["opencode-go/muse-spark-1.3-contributor"] },
+			current: { provider: "anthropic", id: "claude-opus-4-8" },
+			seedCooldownsMsFromNow: { "anthropic-account-2": 60_000 },
+		});
+		await finishError(t, "anthropic", "claude-opus-4-8", TASK173_RATE_BODY);
+		assert.ok(
+			!t.rec.setModels.some((model) => model.startsWith("opencode-go/")),
+			"the package must not move cross-provider for a declared chain",
+		);
+		assert.equal(
+			t.readState().pendingReason,
+			undefined,
+			"no package-owned wait may hold the pane; the profile chain owns the hand-off",
+		);
+	} finally {
+		if (previousAgent === undefined) delete process.env.SULA_DESKTOP_AGENT;
+		else process.env.SULA_DESKTOP_AGENT = previousAgent;
+		rmSync(profilePath, { force: true });
+	}
+});
+
+test("TASK-173: an automatic resume that has waited longer than the cap stops with a terminal notice", async () => {
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+			"anthropic-account-2": { type: "oauth", access: "b", refresh: "br" },
+		},
+		config: TASK173_CONFIG,
+		seedState: {
+			stateVersion: 5,
+			exhaustedUntilByProvider: { anthropic: Date.now() + 60_000, "anthropic-account-2": Date.now() + 60_000 },
+			lastProbeAtByProvider: {},
+			invalidatedByProvider: {},
+			lastSwitches: [],
+			pendingFrom: "anthropic/claude-opus-4-8",
+			pendingReason: "assistant error: 429",
+			pendingSince: Date.now() - 7 * 60 * 60 * 1000,
+		},
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		idle: true,
+	});
+	// A new limit error re-arms the pending resume; the wait is already past the cap.
+	await finishError(t, "anthropic", "claude-opus-4-8", TASK173_RATE_BODY);
+	assert.equal(t.readState().pendingReason, undefined, "an outage past the cap must clear the pending resume");
+	assert.ok(
+		t.rec.notifies.some((message) => /automatic resume stopped/i.test(message) && /6h|6 hours/.test(message)),
+		`a terminal notice naming the horizon is required; notifies=${JSON.stringify(t.rec.notifies)}`,
+	);
+});

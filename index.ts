@@ -571,6 +571,13 @@ const USAGE_UNTRUSTED_MS = 30 * 60 * 1000;
 // Minimum backoff to record for a session/rate limit the usage window cannot see, so the wake
 // timer polls (every PENDING_POLL_MS) instead of hot-retrying a maxed account every second.
 const SESSION_LIMIT_FLOOR_MS = 5 * 60 * 1000;
+// TASK-173: a rate-limit (429) cooldown is never shorter than a per-minute window. The owner
+// config cooldownMs (3s) let a limited Anthropic account be re-probed in a flip loop while its
+// per-minute token bucket was still exhausted; the session then died inside the core retry budget.
+const LIMIT_MIN_COOLDOWN_MS = 60 * 1000;
+// TASK-173: an automatic resume that has waited this long (every account still limited) stops
+// with a terminal notice naming the horizon instead of re-checking forever.
+const PENDING_MAX_WAIT_MS = 6 * 60 * 60 * 1000;
 const AUTH_CHANGE_POLL_MS = 5000;
 // While a session is paused waiting for ANY account to recover, never sleep longer than this
 // between availability checks. A single multi-hour timer would miss an account that recovers
@@ -1970,6 +1977,20 @@ function percentValue(value: string | undefined) {
 	return Number.isFinite(numeric) ? numeric : undefined;
 }
 
+function rfc3339ToCooldownMs(value: string | undefined) {
+	if (!value) return undefined;
+	const at = Date.parse(value);
+	return Number.isFinite(at) ? Math.max(0, at - Date.now()) : undefined;
+}
+
+const ANTHROPIC_RESET_HEADERS = [
+	"anthropic-ratelimit-unified-reset",
+	"anthropic-ratelimit-requests-reset",
+	"anthropic-ratelimit-tokens-reset",
+	"anthropic-ratelimit-input-tokens-reset",
+	"anthropic-ratelimit-output-tokens-reset",
+];
+
 function cooldownFromHeaders(headers: Record<string, string>) {
 	const normalized = new Map(
 		Object.entries(headers).map(([key, value]) => [key.toLowerCase(), value]),
@@ -1986,11 +2007,17 @@ function cooldownFromHeaders(headers: Record<string, string>) {
 		secondsToMs(get("x-codex-secondary-reset-after-seconds")),
 		unixSecondsToCooldownMs(get("x-codex-secondary-reset-at")),
 	]);
+	// Anthropic reports one RFC 3339 reset per bucket; the latest one is when the limit clears.
+	const anthropicResets = ANTHROPIC_RESET_HEADERS.map((name) =>
+		rfc3339ToCooldownMs(get(name)),
+	).filter((value): value is number => value !== undefined);
+	const anthropicReset =
+		anthropicResets.length > 0 ? Math.max(...anthropicResets) : undefined;
 	if ((secondaryUsed ?? 0) >= 100)
 		return secondaryReset ?? retryAfter ?? primaryReset;
 	if ((primaryUsed ?? 0) >= 100)
 		return primaryReset ?? retryAfter ?? secondaryReset;
-	return retryAfter ?? primaryReset ?? secondaryReset;
+	return retryAfter ?? primaryReset ?? secondaryReset ?? anthropicReset;
 }
 
 function cooldownFromErrorText(errorText: string) {
@@ -3750,7 +3777,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			// floor the "usage says free" branch uses instead of collapsing to cooldownMs.
 			hintedCooldowns.push(SESSION_LIMIT_FLOOR_MS);
 		}
-		if (hintedCooldowns.length === 0) return config.cooldownMs;
+		// TASK-173: with no reset hint from the provider, a limit is never re-probed inside a
+		// per-minute window (the owner's short cooldownMs made a flip loop).
+		if (hintedCooldowns.length === 0)
+			return Math.max(config.cooldownMs, LIMIT_MIN_COOLDOWN_MS);
 		// Backstop: never let a single live estimate lock an account beyond the ceiling.
 		return Math.min(Math.max(...hintedCooldowns), MAX_LIVE_COOLDOWN_MS);
 	}
@@ -4539,7 +4569,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				`Provider failover: no immediately available fallback after ${failedModel.provider}/${failedModel.id}. ${availability || "All known accounts may be unauthenticated, invalidated, or duplicate slots."}`,
 				"warning",
 			);
-			if (!options.manual && config.autoContinue)
+			if (!options.manual && config.autoContinue && !sessionAgentHasDeclaredFallbackChain(ctx))
 				setPendingContinuation(ctx, failedModel, reason);
 			return false;
 		}
@@ -4551,7 +4581,14 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			reason,
 			{ armContinuation: !options.manual },
 		);
-		if (!switched && !options.manual && config.autoContinue) {
+		// TASK-173: a declared-chain agent's profile chain owns the wait and the hand-off to its
+		// next target once every same-family account is limited; the package must not hold the pane.
+		if (
+			!switched &&
+			!options.manual &&
+			config.autoContinue &&
+			!sessionAgentHasDeclaredFallbackChain(ctx)
+		) {
 			if (!armSameAccountResumeIfReady(ctx, failedModel, reason, options))
 				setPendingContinuation(ctx, failedModel, reason);
 		}
@@ -5156,6 +5193,16 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			!config.autoContinue
 		)
 			return;
+		// TASK-173: a real outage ends in a durable terminal notice, never an endless re-check.
+		const waitedSince = persistedState.pendingSince;
+		if (waitedSince && Date.now() - waitedSince > PENDING_MAX_WAIT_MS) {
+			clearPendingContinuation();
+			ctx?.ui?.notify?.(
+				`Provider failover: automatic resume stopped; every account stayed limited for more than ${formatDelay(PENDING_MAX_WAIT_MS)} (since ${new Date(waitedSince).toLocaleString()}). Send a message to retry.`,
+				"error",
+			);
+			return;
+		}
 		const delay = nextPendingWakeDelayMs();
 		if (delay === undefined) return;
 		// Cap the sleep so we re-check availability periodically instead of trusting a single
