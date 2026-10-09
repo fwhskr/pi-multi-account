@@ -520,6 +520,10 @@ type ProviderFailoverState = {
 	invalidatedByProvider?: Record<string, InvalidationRecord>;
 	usageByProvider?: Record<string, UsageSnapshot>;
 	codexModelCatalogByProvider?: Record<string, CodexCatalogSnapshot>;
+	rateLimitHeadersByProvider?: Record<
+		string,
+		{ at: number; headers: Record<string, string> }
+	>;
 	pendingContinuationPrompt?: string;
 	pendingFrom?: ModelRef;
 	pendingSince?: number;
@@ -562,19 +566,23 @@ const MIN_PENDING_WAKE_MS = 1000;
 // The usage-% endpoint tracks an account's QUOTA window; it does NOT reflect session/rate limits.
 // So a session-limited account keeps 429ing "usage limit reached" while usage still reports
 // headroom. Trusting usage as ground truth then reports the account "free now", schedules a ~1s
-// retry, gets 429 again, and loops. Once a provider limit-errors TWICE within this window (no
-// success in between), the usage reading is proven a liar for this account and is distrusted.
-const LIMIT_STREAK_WINDOW_MS = 15 * 60 * 1000;
+// retry, gets 429 again, and loops. Once a provider limit-errors TWICE in a row (no success in
+// between), the usage reading is proven a liar for this account and is distrusted.
 // How long to ignore "usage says free" for a provider after usage has been proven wrong, so the
 // recorded cooldown from the real error sticks instead of being cleared on the next poll.
 const USAGE_UNTRUSTED_MS = 30 * 60 * 1000;
-// Minimum backoff to record for a session/rate limit the usage window cannot see, so the wake
-// timer polls (every PENDING_POLL_MS) instead of hot-retrying a maxed account every second.
-const SESSION_LIMIT_FLOOR_MS = 5 * 60 * 1000;
 // TASK-173: a rate-limit (429) cooldown is never shorter than a per-minute window. The owner
 // config cooldownMs (3s) let a limited Anthropic account be re-probed in a flip loop while its
 // per-minute token bucket was still exhausted; the session then died inside the core retry budget.
 const LIMIT_MIN_COOLDOWN_MS = 60 * 1000;
+// TASK-173b: a provider that keeps refusing with no valid reset hint waits LIMIT_MIN_COOLDOWN_MS *
+// 2^(streak-1) per probe, never more than LIMIT_MAX_PROBE_MS. The streak does not decay with time; only
+// a real success on that provider (or /multi-account reset) clears it. Bounded: no unbounded lock.
+const LIMIT_MAX_PROBE_MS = 60 * 60 * 1000;
+// TASK-173b: reset/retry headers kept from a 429 for diagnosis: a few short name=value pairs only.
+const RATE_LIMIT_HEADER_KEEP = 12;
+const RATE_LIMIT_HEADER_NAME_MAX = 64;
+const RATE_LIMIT_HEADER_VALUE_MAX = 80;
 // TASK-173: an automatic resume that has waited this long (every account still limited) stops
 // with a terminal notice naming the horizon instead of re-checking forever.
 const PENDING_MAX_WAIT_MS = 6 * 60 * 60 * 1000;
@@ -2030,6 +2038,27 @@ function cooldownFromHeaders(headers: Record<string, string>) {
 	return retryAfter ?? primaryReset ?? secondaryReset ?? anthropicReset;
 }
 
+// TASK-173b: the capped escalation floor for a refusal streak (no valid reset hint).
+function limitStreakFloorMs(streak: number): number {
+	const exponent = Math.min(Math.max(streak, 1) - 1, 20);
+	return Math.min(LIMIT_MIN_COOLDOWN_MS * 2 ** exponent, LIMIT_MAX_PROBE_MS);
+}
+
+// TASK-173b: keep only the Anthropic rate-limit and Retry-After headers from a 429, names and
+// truncated values only. Bounded in count and size; never credentials (they are not on the list).
+function rateLimitHeaderSnapshot(headers: unknown): Record<string, string> {
+	const out: Record<string, string> = {};
+	if (!headers || typeof headers !== "object") return out;
+	for (const [rawName, rawValue] of Object.entries(headers as Record<string, unknown>).slice(0, 200)) {
+		if (Object.keys(out).length >= RATE_LIMIT_HEADER_KEEP) break;
+		const name = rawName.toLowerCase().slice(0, RATE_LIMIT_HEADER_NAME_MAX);
+		if (!(name.startsWith("anthropic-ratelimit-") || name === "retry-after")) continue;
+		if (typeof rawValue !== "string" && typeof rawValue !== "number") continue;
+		out[name] = redactForLog(String(rawValue)).slice(0, RATE_LIMIT_HEADER_VALUE_MAX);
+	}
+	return out;
+}
+
 function cooldownFromErrorText(errorText: string) {
 	const bodyReset = firstDefinedMs([
 		secondsToMs(errorText.match(/"resets_in_seconds"\s*:\s*(\d+)/i)?.[1]),
@@ -2560,10 +2589,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// errors in a row prove the usage-% window is not seeing this account's real limit, so usage is
 	// distrusted until `usageUntrustedUntilByProvider` expires — this is what stops the ~1s
 	// retry-loop against a session-limited account whose quota window still shows headroom.
-	const limitStreakByProvider = new Map<
-		string,
-		{ count: number; lastAt: number }
-	>();
+	const limitStreakByProvider = new Map<string, { count: number; lastAt: number }>();
 	const usageUntrustedUntilByProvider = new Map<string, number>();
 
 	// Discovered, authed, deduped provider ids in rotation order.
@@ -3673,13 +3699,13 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		return (usageUntrustedUntilByProvider.get(provider) ?? 0) > now;
 	}
 
-	// Record a limit error for a provider and return the consecutive streak. A second error within
-	// LIMIT_STREAK_WINDOW_MS (no success reset in between) flips the account's usage reading to
-	// "distrusted" so its real cooldown can no longer be cleared by a lying "usage says free".
+	// Record a limit error for a provider and return the consecutive streak. TASK-173b: the streak does
+	// NOT decay with time; only a real success on the provider (or /multi-account reset) clears it. A
+	// second error in a streak flips the account's usage reading to "distrusted" so its real cooldown
+	// can no longer be cleared by a lying "usage says free".
 	function noteLimitError(provider: string, now = Date.now()): number {
 		const prev = limitStreakByProvider.get(provider);
-		const count =
-			prev && now - prev.lastAt < LIMIT_STREAK_WINDOW_MS ? prev.count + 1 : 1;
+		const count = (prev?.count ?? 0) + 1;
 		limitStreakByProvider.set(provider, { count, lastAt: now });
 		if (count >= 2)
 			usageUntrustedUntilByProvider.set(provider, now + USAGE_UNTRUSTED_MS);
@@ -3776,21 +3802,18 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			// the 0 and record a real floor cooldown instead of returning 0 and hot-looping a retry.
 			if (usageMs === 0) {
 				if (streak < 2) return 0;
-				hintedCooldowns.push(SESSION_LIMIT_FLOOR_MS);
 			} else if (usageMs !== undefined && usageMs > 0) {
 				hintedCooldowns.push(usageMs);
 			}
-		} else if (streak >= 2) {
-			// No live usage reading (for example showUsage is off) and this account has now
-			// limit-errored twice in a row: the weekly window cannot see a session/rate limit,
-			// so the momentary config.cooldownMs is not credible. Apply the same session-limit
-			// floor the "usage says free" branch uses instead of collapsing to cooldownMs.
-			hintedCooldowns.push(SESSION_LIMIT_FLOOR_MS);
 		}
-		// TASK-173: with no reset hint from the provider, a limit is never re-probed inside a
-		// per-minute window (the owner's short cooldownMs made a flip loop).
+		// TASK-173b: with no valid reset hint from the provider, the probe wait escalates with the
+		// refusal streak (60s, 120s, 240s... capped at LIMIT_MAX_PROBE_MS). Never a flip loop, never an
+		// unbounded lock; a reset header or Retry-After that is valid still wins (bounded above).
 		if (hintedCooldowns.length === 0)
-			return Math.max(config.cooldownMs, LIMIT_MIN_COOLDOWN_MS);
+			return Math.min(
+				Math.max(config.cooldownMs, limitStreakFloorMs(streak)),
+				LIMIT_MAX_PROBE_MS,
+			);
 		// Backstop: never let a single live estimate lock an account beyond the ceiling.
 		return Math.min(Math.max(...hintedCooldowns), MAX_LIVE_COOLDOWN_MS);
 	}
@@ -5888,6 +5911,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			clearPendingContinuation();
 			clearQueuedInputs();
 			exhaustedUntilByModel.clear();
+			limitStreakByProvider.clear();
 			persistedState = {
 				stateVersion: STATE_VERSION,
 				exhaustedUntilByProvider: {},
@@ -6493,6 +6517,25 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			// Only set cooldown hints for providers this extension manages.
 			// Without this guard, a 429 on any provider pollutes cooldown state.
 			if (!classifyProvider(ctx.model.provider, config.qwenProvider)) return;
+			if (status === 429 && /^anthropic(-|$)/.test(ctx.model.provider)) {
+				// TASK-173b: record which reset/retry headers a refusal carried (names and short values
+				// only), so the next investigation can see whether reset headers arrive. Fail open.
+				try {
+					const headers = rateLimitHeaderSnapshot((event as any).headers);
+					persist({
+						rateLimitHeadersByProvider: {
+							...(persistedState.rateLimitHeadersByProvider ?? {}),
+							[ctx.model.provider]: { at: Date.now(), headers },
+						},
+					});
+					logEvent("rate_limit_headers", {
+						provider: ctx.model.provider,
+						headers: JSON.stringify(headers),
+					});
+				} catch {
+					/* diagnostics only; never affects failover */
+				}
+			}
 			const cooldownMs = cooldownFromHeaders((event as any).headers ?? {});
 			if (cooldownMs !== undefined) {
 				responseCooldownHints.set(

@@ -4300,6 +4300,120 @@ test("TASK-173: an agent WITHOUT a declared chain still gets the pending-continu
 	}
 });
 
+// TASK-173b: the refusal streak is the escalation input for a provider that keeps refusing with
+// no reset hint. It must survive quiet time (no decay), escalate the probe wait, clear on a real
+// success, stay per-account, and the 429 header capture must stay bounded.
+function withFakeClock(testContext: { mock: { method: (o: any, k: string, f: () => number) => unknown } }, start: number) {
+	let now = start;
+	testContext.mock.method(Date, "now", () => now);
+	return {
+		now: () => now,
+		advance(ms: number) {
+			now += ms;
+		},
+	};
+}
+
+// Remaining live cooldown on a provider at nowMs, in ms.
+function remainingFor(t: ReturnType<typeof setup>, provider: string, nowMs: number) {
+	return (t.readState().exhaustedUntilByProvider?.[provider] ?? 0) - nowMs;
+}
+
+function twoAnthropicAccounts() {
+	return setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+			"anthropic-account-2": { type: "oauth", access: "b", refresh: "br" },
+		},
+		config: TASK173_CONFIG,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		idle: false,
+	});
+}
+
+test("TASK-173b: the refusal streak survives more than 15 minutes of quiet when no success happened", async (testContext) => {
+	const clock = withFakeClock(testContext, Date.parse("2026-10-09T14:00:00Z"));
+	const t = twoAnthropicAccounts();
+	await finishError(t, "anthropic", "claude-opus-4-8", TASK173_RATE_BODY);
+	clock.advance(20 * 60 * 1000);
+	t.setCurrent("anthropic", "claude-opus-4-8");
+	await finishError(t, "anthropic", "claude-opus-4-8", TASK173_RATE_BODY);
+	const remainingMs = remainingFor(t, "anthropic", clock.now());
+	assert.ok(
+		remainingMs >= 110_000,
+		`a second refusal 20 min later is still streak 2 and must wait ~120s, got ${remainingMs}ms`,
+	);
+});
+
+test("TASK-173b: repeated refusals with no reset hint escalate 60s, 120s, 240s... capped at 60 min", async (testContext) => {
+	const clock = withFakeClock(testContext, Date.parse("2026-10-09T14:00:00Z"));
+	const t = twoAnthropicAccounts();
+	const seen: number[] = [];
+	for (let i = 0; i < 8; i++) {
+		t.setCurrent("anthropic", "claude-opus-4-8");
+		await finishError(t, "anthropic", "claude-opus-4-8", TASK173_RATE_BODY);
+		const remaining = remainingFor(t, "anthropic", clock.now());
+		seen.push(Math.round(remaining / 1000));
+		clock.advance(remaining + 1000);
+	}
+	assert.deepEqual(
+		seen,
+		[60, 120, 240, 480, 960, 1920, 3600, 3600],
+		`escalation sequence (seconds) was ${JSON.stringify(seen)}`,
+	);
+});
+
+test("TASK-173b: a real success clears the refusal streak so the next refusal waits the 60s floor again", async (testContext) => {
+	const clock = withFakeClock(testContext, Date.parse("2026-10-09T14:00:00Z"));
+	const t = twoAnthropicAccounts();
+	for (let i = 0; i < 2; i++) {
+		t.setCurrent("anthropic", "claude-opus-4-8");
+		await finishError(t, "anthropic", "claude-opus-4-8", TASK173_RATE_BODY);
+		clock.advance(remainingFor(t, "anthropic", clock.now()) + 1000);
+	}
+	t.setCurrent("anthropic", "claude-opus-4-8");
+	await t.fire("after_provider_response", { status: 200, headers: {} });
+	await finishError(t, "anthropic", "claude-opus-4-8", TASK173_RATE_BODY);
+	const remainingMs = remainingFor(t, "anthropic", clock.now());
+	assert.ok(
+		remainingMs >= 55_000 && remainingMs <= 65_000,
+		`after a success the streak restarts at the 60s floor, got ${remainingMs}ms`,
+	);
+});
+
+test("TASK-173b: a different account's refusal streak is independent", async (testContext) => {
+	const clock = withFakeClock(testContext, Date.parse("2026-10-09T14:00:00Z"));
+	const t = twoAnthropicAccounts();
+	for (let i = 0; i < 3; i++) {
+		t.setCurrent("anthropic", "claude-opus-4-8");
+		await finishError(t, "anthropic", "claude-opus-4-8", TASK173_RATE_BODY);
+		clock.advance(remainingFor(t, "anthropic", clock.now()) + 1000);
+	}
+	t.setCurrent("anthropic-account-2", "claude-opus-5");
+	await finishError(t, "anthropic-account-2", "claude-opus-5", TASK173_RATE_BODY);
+	const second = remainingFor(t, "anthropic-account-2", clock.now());
+	assert.ok(
+		second >= 55_000 && second <= 65_000,
+		`account-2's first refusal must wait the 60s floor, not account-1's escalated streak; got ${second}ms`,
+	);
+});
+
+test("TASK-173b: the 429 header capture is bounded: few entries, short values, only reset headers", async () => {
+	const t = twoAnthropicAccounts();
+	const headers: Record<string, string> = { "x-not-captured": "1", "retry-after": "42" };
+	for (let i = 0; i < 100; i++) headers[`anthropic-ratelimit-test-${i}`] = "x".repeat(5000);
+	await t.fire("agent_start");
+	await t.fire("after_provider_response", { status: 429, headers });
+	const captured = t.readState().rateLimitHeadersByProvider?.anthropic?.headers ?? {};
+	const names = Object.keys(captured);
+	assert.ok(names.length > 0, "the 429 reset headers must be captured");
+	assert.ok(names.length <= 12, `at most 12 headers kept, got ${names.length}`);
+	assert.equal(captured["retry-after"], "42", "retry-after must be captured");
+	assert.ok(!names.includes("x-not-captured"), "non-rate-limit headers must not be captured");
+	for (const value of Object.values(captured)) assert.ok((value as string).length <= 80, "values are truncated");
+	assert.ok(JSON.stringify(t.readState()).length < 20_000, "the state record stays small");
+});
+
 // TASK-173: a malformed or far-future reset header must not lock an account for the 6h ceiling.
 test("TASK-173: a '9999' reset header (Date.parse year 9999) does not lock the account; it gets the floor", async () => {
 	const t = setup({
