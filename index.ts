@@ -2044,6 +2044,15 @@ function limitStreakFloorMs(streak: number): number {
 	return Math.min(LIMIT_MIN_COOLDOWN_MS * 2 ** exponent, LIMIT_MAX_PROBE_MS);
 }
 
+// TASK-173: every 429 wait is max(hint, escalation floor), capped at the 429 probe cap and the live ceiling.
+function boundedLimitWaitMs(hintMs: number, streak: number): number {
+	return Math.min(
+		Math.max(hintMs, limitStreakFloorMs(streak)),
+		LIMIT_MAX_PROBE_MS,
+		MAX_LIVE_COOLDOWN_MS,
+	);
+}
+
 // TASK-173b: keep only the Anthropic rate-limit and Retry-After headers from a 429, names and
 // truncated values only. Bounded in count and size; never credentials (they are not on the list).
 function rateLimitHeaderSnapshot(headers: unknown): Record<string, string> {
@@ -3785,9 +3794,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// Count consecutive refusals, independent of elapsed time.
 		const streak = noteLimitError(provider, now);
 		const responseHint = responseCooldownHints.get(provider);
-		// A plausible absolute server reset wins over escalation, but remains floored/capped.
+		// A plausible absolute server reset is a hint, never a way below the streak escalation floor.
 		if (responseHint?.absoluteReset !== undefined)
-			return Math.min(Math.max(responseHint.absoluteReset, LIMIT_MIN_COOLDOWN_MS), LIMIT_MAX_PROBE_MS);
+			return boundedLimitWaitMs(responseHint.absoluteReset, streak);
 		const hintedCooldowns = [
 			responseHint?.ms,
 			cooldownFromErrorText(errorText),
@@ -3814,12 +3823,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// refusal streak (60s, 120s, 240s... capped at LIMIT_MAX_PROBE_MS). Never a flip loop, never an
 		// unbounded lock; a reset header or Retry-After that is valid still wins (bounded above).
 		if (hintedCooldowns.length === 0)
-			return Math.min(
-				Math.max(config.cooldownMs, limitStreakFloorMs(streak)),
-				LIMIT_MAX_PROBE_MS,
-			);
+			return boundedLimitWaitMs(config.cooldownMs, streak);
 		// Relative hints and usage never weaken the streak floor or exceed the 429 probe cap.
-		return Math.min(Math.max(...hintedCooldowns, limitStreakFloorMs(streak)), LIMIT_MAX_PROBE_MS);
+		return boundedLimitWaitMs(Math.max(...hintedCooldowns), streak);
 	}
 
 	function providersSharingAccount(provider: string): string[] {

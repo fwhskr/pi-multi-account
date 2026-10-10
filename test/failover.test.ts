@@ -4340,6 +4340,21 @@ for (const [label, headers, expected] of [
  });
 }
 
+
+test("TASK-173 D4: a valid reset header never undercuts the streak escalation floor", async (tc) => {
+	const clock = withFakeClock(tc, Date.parse("2026-10-09T14:00:00Z"));
+	const t = twoAnthropicAccounts();
+	const resetHeaders = () => ({ "anthropic-ratelimit-requests-reset": new Date(clock.now() + 120_000).toISOString() });
+	for (let i = 0; i < 3; i++) {
+		t.setCurrent("anthropic", "claude-opus-4-8");
+		await t.fire("after_provider_response", { status: 429, headers: resetHeaders() });
+		await finishError(t, "anthropic", "claude-opus-4-8", TASK173_RATE_BODY);
+		if (i < 2) clock.advance(remainingFor(t, "anthropic", clock.now()) + 1000);
+	}
+	const remaining = remainingFor(t, "anthropic", clock.now());
+	assert.ok(remaining >= 235_000 && remaining <= 245_000, `streak 3 with a 120s header must wait the 240s floor, got ${remaining}ms`);
+});
+
 // TASK-173b: the refusal streak is the escalation input for a provider that keeps refusing with
 // no reset hint. It must survive quiet time (no decay), escalate the probe wait, clear on a real
 // success, stay per-account, and the 429 header capture must stay bounded.
