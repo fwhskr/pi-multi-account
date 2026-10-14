@@ -24,7 +24,7 @@
  * State:   ~/.pi/agent/provider-failover-state.json
  */
 
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
 	appendFileSync,
 	existsSync,
@@ -2635,8 +2635,12 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	let autoContinuesThisPrompt = 0;
 	let pendingWakeTimer: ReturnType<typeof setTimeout> | undefined;
 	let queuedInputWakeTimer: ReturnType<typeof setTimeout> | undefined;
+	let queuedInputDeadlineTimer: ReturnType<typeof setTimeout> | undefined;
+	let queuedInputGeneration = 0;
+	let queuedInputResumeGeneration: number | undefined;
+	let queuedInputHold: { holdId: string; queuedAt: number } | undefined;
 	let usageStatusTimer: ReturnType<typeof setInterval> | undefined;
-	const queuedUserInputs: Array<{ text: string; images?: any[] }> = [];
+	const queuedUserInputs: Array<{ text: string; images?: any[]; deadlineAt: number }> = [];
 	let continuationDispatchedForAgentTurn = false; // avoid agent_end double-dispatch after message_end failover
 	let userAbortedChain = false; // user pressed Esc → stop auto-continuing until a new prompt
 	let lastLeftProvider: string | undefined; // account we just failed away from (anti-ping-pong)
@@ -5426,7 +5430,52 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			clearTimeout(queuedInputWakeTimer);
 			queuedInputWakeTimer = undefined;
 		}
+		if (queuedInputDeadlineTimer) {
+			clearTimeout(queuedInputDeadlineTimer);
+			queuedInputDeadlineTimer = undefined;
+		}
+		queuedInputGeneration++;
+		queuedInputHold = undefined;
 		queuedUserInputs.length = 0;
+	}
+
+	function failQueuedInputs(ctx: any, reason: string) {
+		if (queuedUserInputs.length === 0) return;
+		const count = queuedUserInputs.length;
+		const failure = {
+			version: 1,
+			reason: reason.trim().slice(0, 1024) || "unknown delivery error",
+			holdId: queuedInputHold!.holdId,
+			queuedAt: queuedInputHold!.queuedAt,
+			deadlineAt: Math.min(...queuedUserInputs.map((input) => input.deadlineAt)),
+		};
+		clearQueuedInputs();
+		// The delegated-runtime consumer owns run identity, stamped terminal
+		// sidecars and parent settlement. This package never forges those records.
+		try {
+			pi.appendEntry("held-input-delivery-failed", failure);
+		} catch (error) {
+			reportExtensionError("queued input failure diagnostic", error, ctx);
+		}
+		pi.events.emit("pi:held-input-delivery-failed:v1", failure);
+		ctx.ui.notify(
+			`Provider failover: queued message delivery failed (${count} message(s)): ${failure.reason}. Send a message to retry.`,
+			"error",
+		);
+	}
+
+	function scheduleQueuedInputDeadline(ctx: any) {
+		if (queuedInputDeadlineTimer) clearTimeout(queuedInputDeadlineTimer);
+		queuedInputDeadlineTimer = undefined;
+		if (queuedUserInputs.length === 0) return;
+		// Independent of eligibility, idle state, and async model activation. Never
+		// move an admitted message's bound when a later poll reports a new cooldown.
+		const deadlineAt = Math.min(...queuedUserInputs.map((input) => input.deadlineAt));
+		queuedInputDeadlineTimer = setTimeout(() => {
+			queuedInputDeadlineTimer = undefined;
+			failQueuedInputs(ctx, "the hold exceeded its cooldown end by 60s");
+		}, Math.max(0, deadlineAt - Date.now()));
+		queuedInputDeadlineTimer.unref?.();
 	}
 
 	function nextModelAvailabilityDelayMs(ctx: any): number | undefined {
@@ -5459,6 +5508,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		const availabilityDelay = nextModelAvailabilityDelayMs(ctx);
 		if (availabilityDelay === undefined) {
 			queuedInputWakeTimer = undefined;
+			failQueuedInputs(ctx, "no usable authenticated account remains");
 			return;
 		}
 		// Poll auth.json too, so a /login in another Pi process wakes this session quickly
@@ -5476,34 +5526,56 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	async function attemptQueuedInputResume(ctx: any) {
 		if (queuedUserInputs.length === 0 || userAbortedChain || !config.enabled)
 			return;
-		if (!ctx.isIdle()) {
-			scheduleQueuedInputWake(ctx);
-			return;
-		}
-		reconcileCooldownsFromUsage(ctx);
-		const ready = await ensureReadyModel(
-			ctx,
-			"queued input: account became available",
-		);
-		if (!ready) {
-			scheduleQueuedInputWake(ctx);
-			return;
-		}
-		const inputs = queuedUserInputs.splice(0);
-		if (queuedInputWakeTimer) {
-			clearTimeout(queuedInputWakeTimer);
-			queuedInputWakeTimer = undefined;
-		}
-		for (let i = 0; i < inputs.length; i++) {
-			pi.sendUserMessage(
-				queuedInputContent(inputs[i]),
-				i === 0 ? undefined : { deliverAs: "followUp" },
+		const generation = queuedInputGeneration;
+		if (queuedInputResumeGeneration === generation) return;
+		queuedInputResumeGeneration = generation;
+		try {
+			if (!ctx.isIdle()) {
+				scheduleQueuedInputWake(ctx);
+				return;
+			}
+			reconcileCooldownsFromUsage(ctx);
+			const ready = await ensureReadyModel(
+				ctx,
+				"queued input: account became available",
 			);
+			// Stop, shutdown, reset, or the deadline may have cancelled the hold
+			// while setModel was in flight. Never dispatch that stale generation.
+			if (generation !== queuedInputGeneration) return;
+			if (!ready) {
+				scheduleQueuedInputWake(ctx);
+				return;
+			}
+			let sent = 0;
+			while (queuedUserInputs.length > 0) {
+				const input = queuedUserInputs[0];
+				if (Date.now() >= input.deadlineAt) {
+					failQueuedInputs(ctx, "the hold exceeded its cooldown end by 60s");
+					return;
+				}
+				// The host accepts synchronously; awaiting also catches older/adapted
+				// hosts that reject asynchronously. Do not drain before acceptance.
+				await pi.sendUserMessage(
+					queuedInputContent(input),
+					sent === 0 ? undefined : { deliverAs: "followUp" },
+				);
+				if (generation !== queuedInputGeneration) return;
+				queuedUserInputs.shift();
+				sent++;
+			}
+			clearQueuedInputs();
+			ctx.ui.notify(
+				`Provider failover: resumed ${sent} queued message(s) on ${ctx.model.provider}/${ctx.model.id}.`,
+				"info",
+			);
+		} catch (error) {
+			if (generation === queuedInputGeneration) {
+				failQueuedInputs(ctx, error instanceof Error ? error.message : String(error));
+			}
+		} finally {
+			if (queuedInputResumeGeneration === generation)
+				queuedInputResumeGeneration = undefined;
 		}
-		ctx.ui.notify(
-			`Provider failover: resumed ${inputs.length} queued message(s) on ${ctx.model.provider}/${ctx.model.id}.`,
-			"info",
-		);
 	}
 
 	function queueUserInput(ctx: any, text: string, images?: any[]) {
@@ -5514,9 +5586,14 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			);
 			return;
 		}
-		queuedUserInputs.push({ text, images });
 		const delay = nextModelAvailabilityDelayMs(ctx);
-		if (delay === undefined) return;
+		queuedInputHold ??= { holdId: randomUUID(), queuedAt: Date.now() };
+		queuedUserInputs.push({ text, images, deadlineAt: Date.now() + (delay ?? 0) + 60_000 });
+		scheduleQueuedInputDeadline(ctx);
+		if (delay === undefined) {
+			failQueuedInputs(ctx, "no usable authenticated account remains");
+			return;
+		}
 		scheduleQueuedInputWake(ctx);
 		ctx.ui.notify(
 			`Provider failover: all usable accounts are cooling down. Your message is held in memory and will be sent automatically in ~${formatDelay(delay)}; /multi-account stop cancels it.`,
