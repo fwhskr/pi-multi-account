@@ -27,6 +27,8 @@ export type UsageCredential = {
 	accountId?: string;
 	key?: string;
 	expires?: number;
+	clientId?: string;
+	scopes?: string[];
 };
 
 export class UsageFetchError extends Error {
@@ -39,8 +41,8 @@ export class UsageFetchError extends Error {
 	}
 }
 
-function record(value: unknown): Record<string, any> {
-	return value && typeof value === "object" ? (value as Record<string, any>) : {};
+function record(value: unknown): Record<string, unknown> {
+	return value && typeof value === "object" ? (value as Record<string, unknown>) : {};
 }
 
 function finiteNumber(value: unknown): number | undefined {
@@ -77,7 +79,7 @@ function usageWindow(value: unknown, fallbackWindowSeconds?: number): UsageWindo
 }
 
 export function usageFamily(provider: string): UsageFamily | undefined {
-	if (provider === "openai-codex" || /^openai-codex-account-\d+$/.test(provider)) return "codex";
+	if (/^openai(?:-codex)?(?:-account-\d+)?$/.test(provider)) return "codex";
 	if (provider === "anthropic" || /^anthropic-account-\d+$/.test(provider)) return "anthropic";
 	if (provider === "ollama" || /^ollama-account-\d+$/.test(provider)) return "ollama";
 	if (provider === "cursor" || /^cursor-account-\d+$/.test(provider)) return "cursor";
@@ -360,6 +362,12 @@ export async function fetchUsageSnapshot(
 		throw new UsageFetchError(`${provider} has no OAuth access token`);
 	}
 
+	// Direct OpenAI grants are audience-scoped to api.openai.com. The legacy
+	// ChatGPT usage endpoint rejects them; do not leak them across audiences or
+	// treat its 401 as an expired credential that needs account invalidation.
+	if (family === "codex" && (credential.clientId || credential.scopes?.includes("chatgpt.tokens.use.direct"))) {
+		throw new UsageFetchError("OpenAI subscription limits are not exposed for direct OAuth credentials");
+	}
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? 10_000);
 	const headers: Record<string, string> = {
@@ -402,6 +410,7 @@ export async function fetchUsageSnapshot(
 
 export function providerUsageLabel(provider: string): string {
 	const index = provider.match(/-account-(\d+)$/)?.[1];
+	if (/^openai(?:-account-\d+)?$/.test(provider)) return index ? `OpenAI A${index}` : "OpenAI";
 	if (provider.startsWith("openai-codex")) return index ? `Codex A${index}` : "Codex";
 	if (provider.startsWith("anthropic")) return index ? `Claude A${index}` : "Claude";
 	if (provider.startsWith("ollama")) return index ? `Ollama A${index}` : "Ollama";

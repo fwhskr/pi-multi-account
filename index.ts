@@ -130,9 +130,11 @@ function findPiAiRoot(): string | undefined {
 	if (piAiPackageRoot !== undefined) return piAiPackageRoot ?? undefined;
 	const here = fileURLToPath(import.meta.url);
 	const localRequire = createRequire(import.meta.url);
-	for (const candidate of piAiRootCandidates(here, (specifier) =>
+	// Prefer the running host over a stale package-local pi-ai copy.
+	const host = process.argv[1] ? piAiRootCandidates(process.argv[1]) : [];
+	for (const candidate of [...host, ...piAiRootCandidates(here, (specifier) =>
 		localRequire.resolve(specifier),
-	)) {
+	)]) {
 		if (existsSync(join(candidate, "package.json"))) {
 			piAiPackageRoot = candidate;
 			return candidate;
@@ -224,7 +226,7 @@ function adaptProviderFactories(
 	codexMod: any,
 ): PiAiOauthBridge | undefined {
 	const anthropicOauth = anthropicMod?.anthropicProvider?.()?.auth?.oauth;
-	const codexOauth = codexMod?.openaiCodexProvider?.()?.auth?.oauth;
+	const codexOauth = (codexMod?.openaiProvider?.() ?? codexMod?.openaiCodexProvider?.())?.auth?.oauth;
 	if (
 		typeof anthropicOauth?.login !== "function" ||
 		typeof anthropicOauth?.refresh !== "function" ||
@@ -290,7 +292,9 @@ function tryLoadPiAiOauth(): PiAiOauthBridge | undefined {
 
 	const modern = adaptProviderFactories(
 		load(join("providers", "anthropic.js")),
-		load(join("providers", "openai-codex.js")),
+		load(join("providers", "openai.js"))?.openaiProvider?.()?.auth?.oauth
+			? load(join("providers", "openai.js"))
+			: load(join("providers", "openai-codex.js")),
 	);
 	if (modern) {
 		piAiOauthBridge = modern;
@@ -655,7 +659,19 @@ const BREAKER_FAILURE_THRESHOLD = 3; // consecutive failed recoveries before tri
 const BREAKER_COOLDOWN_MS = 10 * 60 * 1000; // how long advisory mode lasts once tripped
 
 const ANTHROPIC_BASE = "anthropic";
-const CODEX_BASE = "openai-codex";
+// Native OpenAI now owns both API keys and ChatGPT OAuth. Never replace that
+// provider with the retired Codex wire protocol or legacy OAuth callbacks.
+function nativeOpenAIProvider(id = "openai"): any | undefined {
+	const root = findPiAiRoot();
+	if (!root) return undefined;
+	try {
+		const legacy = id.startsWith("openai-codex");
+		const mod = createRequire(import.meta.url)(join(root, `dist/providers/${legacy ? "openai-codex" : "openai"}.js`));
+		const provider = legacy ? mod?.openaiCodexProvider?.() : mod?.openaiProvider?.();
+		return provider?.auth?.oauth?.isSubscription ? provider : undefined;
+	} catch { return undefined; }
+}
+const CODEX_BASE = nativeOpenAIProvider() ? "openai" : "openai-codex";
 const OLLAMA_BASE = "ollama";
 const DEFAULT_QWEN_PROVIDER = "alibaba";
 
@@ -958,7 +974,7 @@ function normalizeConfig(raw: ProviderFailoverConfig): RuntimeConfig {
 		includeOllama: raw.includeOllama ?? true,
 		includeCursor: raw.includeCursor ?? true,
 		neverFailoverProviders: stringArray(raw.neverFailoverProviders),
-		providerOrder: order.filter(
+		providerOrder: order.map(f => (f as string) === "openai" ? "openai-codex" : f).filter(
 			(f): f is ProviderFamily =>
 				f === "anthropic" ||
 				f === "openai-codex" ||
@@ -1415,7 +1431,7 @@ function classifyProvider(
 ): ProviderFamily | undefined {
 	if (id === ANTHROPIC_BASE || /^anthropic-account-\d+$/.test(id))
 		return "anthropic";
-	if (id === CODEX_BASE || /^openai-codex-account-\d+$/.test(id))
+	if (/^openai(?:-codex)?(?:-account-\d+)?$/.test(id))
 		return "openai-codex";
 	if (
 		id === qwenProvider ||
@@ -1774,7 +1790,19 @@ function registerCodexSlot(
 	id: string,
 	models: Array<Record<string, unknown>> = DEFAULT_CODEX_MODELS.map(codexModelDef),
 ) {
-	if (id === CODEX_BASE) return; // base provider is native until live catalog sync enriches it
+	if (id === CODEX_BASE) return; // the base provider remains native
+	const native = nativeOpenAIProvider(id);
+	if (native && /^openai(?:-codex)?(?:-account-\d+)?$/.test(id)) {
+		// Full Provider registration preserves native refresh/login (including
+		// device identity), API-key auth, Responses transport and model filters.
+		const aliasModels = (values: any[]) => values.map(model => ({ ...model, provider: id }));
+		pi.registerProvider({
+			...native, id, name: `OpenAI (${id})`,
+			getModels: () => aliasModels(native.getModels()),
+			getAllModels: () => aliasModels(native.getAllModels?.() ?? native.getModels()),
+		});
+		return;
+	}
 	pi.registerProvider(id, {
 		name: `ChatGPT Plus/Pro (Codex ${id})`,
 		baseUrl: "https://chatgpt.com/backend-api",
@@ -1790,6 +1818,10 @@ function registerCodexCatalog(
 	id: string,
 	models: Array<Record<string, unknown>>,
 ) {
+	if (nativeOpenAIProvider(id) && /^openai(?:-codex)?(?:-account-\d+)?$/.test(id)) {
+		if (id !== CODEX_BASE) registerCodexSlot(pi, id);
+		return;
+	}
 	const name =
 		id === CODEX_BASE
 			? "ChatGPT Plus/Pro (Codex)"
@@ -3024,9 +3056,12 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			if (family === "anthropic") {
 				refreshed = await refreshAnthropicCredentials(entry);
 			} else if (family === "openai-codex") {
+				const oauth = ctx?.modelRegistry?.getProvider?.(provider)?.auth?.oauth ?? nativeOpenAIProvider(provider)?.auth?.oauth;
 				refreshed = mergeRefreshedCredentials(
 					entry,
-					await requirePiAiOauth().codex.refresh(entry as any),
+					oauth?.refresh
+						? await oauth.refresh(entry)
+						: await requirePiAiOauth().codex.refresh(entry as any),
 				);
 			} else if (family === "cursor") {
 				const authMod = await import(
@@ -3225,7 +3260,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	 * only an offline fallback. Catalog snapshots are credential-free and safe to persist.
 	 */
 	async function syncCodexModelCatalog(ctx: any, force = false) {
-		if (!config.autoDiscoverModels) return;
+		// Direct OpenAI OAuth tokens cannot access the retired ChatGPT catalog.
+		// The native provider is authoritative for its catalog and authentication.
+		if (CODEX_BASE === "openai" || !config.autoDiscoverModels) return;
 		const auth = readAuthFile();
 		const providers = Object.keys(auth).filter(
 			(provider) =>
@@ -3934,6 +3971,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		for (const [id, entry] of Object.entries(auth)) {
 			const family = classifyProvider(id, config.qwenProvider);
 			if (!family) continue;
+			// A plain OpenAI API key is not a subscription rotation slot.
+			if (family === "openai-codex" && entry.type !== "oauth") continue;
 			if (family === "qwen" && !config.includeQwen) continue;
 			if (family === "ollama" && !config.includeOllama) continue;
 			if (family === "cursor" && !config.includeCursor) continue;
@@ -6242,7 +6281,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	pi.registerProvider("anthropic", {
 		oauth: anthropicOAuthOverride("anthropic", "Anthropic (Claude Pro/Max)"),
 	} as any);
-	pi.registerProvider("openai-codex", {
+	if (CODEX_BASE !== "openai") pi.registerProvider("openai-codex", {
 		oauth: codexOAuthOverride(
 			"openai-codex",
 			"ChatGPT Plus/Pro (Codex Subscription)",
