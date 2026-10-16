@@ -25,7 +25,20 @@ export type CodexCatalogSnapshot = {
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 const DEFAULT_CONTEXT_WINDOW = 272_000;
 const DEFAULT_MAX_TOKENS = 128_000;
-const KNOWN_PI_THINKING_LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max"];
+// Levels Pi itself understands, weakest → strongest. This is a FILTER, not a grant: a model's
+// own advertised efforts are intersected with this list (see thinkingLevelMap), so a level named
+// here only ever reaches a model that asked for it. Provider gradations differ wildly and do not
+// nest — Claude Opus 4.6 advertises `max` alone, glm-5.2 has `max` but no `xhigh`, gpt-5.6 has
+// `max`/`xhigh`/`minimal` but no `medium` — which is exactly why the per-model intersection, not
+// this list, decides what a given model gets.
+const KNOWN_PI_THINKING_LEVELS = [
+	"minimal",
+	"low",
+	"medium",
+	"high",
+	"xhigh",
+	"max",
+];
 
 function record(value: unknown): Record<string, any> {
 	return value && typeof value === "object" ? (value as Record<string, any>) : {};
@@ -97,7 +110,7 @@ function versionParts(id: string): number[] {
 
 function variantPower(id: string): number {
 	const lower = id.toLowerCase();
-	if (/(?:^|[-_])sol(?:$|[-_])/.test(lower)) return 100;
+	if (/(?:^|[-_])(?:astra|sol)(?:$|[-_])/.test(lower)) return 100;
 	if (/(?:^|[-_])max(?:$|[-_])/.test(lower)) return 95;
 	if (/(?:^|[-_])terra(?:$|[-_])/.test(lower)) return 75;
 	if (/(?:^|[-_])luna(?:$|[-_])/.test(lower)) return 50;
@@ -136,6 +149,9 @@ function isDatedAnthropicAlias(id: string): boolean {
 
 function anthropicTierRank(id: string): number {
 	const lower = id.toLowerCase();
+	// Fable is Anthropic's exceptional/apex line. Keep this separate from generation parsing:
+	// claude-fable-5-1 must outrank every Opus 5 variant, not merely sort as another Claude 5.
+	if (lower.includes("fable")) return 4;
 	if (lower.includes("opus")) return 3;
 	if (lower.includes("sonnet")) return 2;
 	if (lower.includes("haiku")) return 1;
@@ -246,6 +262,70 @@ export class CodexCatalogFetchError extends Error {
 		super(message);
 		this.name = "CodexCatalogFetchError";
 		this.status = status;
+	}
+}
+
+export class OllamaCatalogFetchError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "OllamaCatalogFetchError";
+	}
+}
+
+/**
+ * Pull the live Ollama Cloud model catalog (`GET https://ollama.com/v1/models`).
+ * Unlike Codex, Ollama Cloud publishes a single account-agnostic catalog keyed by an
+ * API key, so one fetch covers the base provider and every cloned `ollama-account-N` slot.
+ * Returns the canonical model ids Ollama Cloud expects in chat requests (e.g. `kimi-k3`,
+ * `glm-5.2`) — no `:cloud` suffix. The extension registers them verbatim; Ollama Cloud
+ * accepts both the bare and the `:cloud`-suffixed form, so legacy configured ids keep working.
+ */
+export async function fetchOllamaCloudCatalog(
+	apiKey: string,
+	options: { fetchImpl?: typeof fetch; timeoutMs?: number } = {},
+): Promise<string[]> {
+	if (!apiKey) throw new OllamaCatalogFetchError("Ollama Cloud has no stored API key");
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? 8_000);
+	try {
+		const response = await (options.fetchImpl ?? fetch)(
+			"https://ollama.com/v1/models",
+			{
+				method: "GET",
+				headers: {
+					Authorization: `Bearer ${apiKey}`,
+					Accept: "application/json",
+					"User-Agent": "pi-multi-account",
+				},
+				signal: controller.signal,
+			},
+		);
+		if (!response.ok) {
+			throw new OllamaCatalogFetchError(
+				`Ollama Cloud catalog returned HTTP ${response.status}`,
+			);
+		}
+		const body = record(await response.json());
+		const data = Array.isArray(body.data) ? body.data : [];
+		const ids: string[] = [];
+		for (const raw of data) {
+			const id = record(raw).id;
+			if (typeof id === "string" && id.trim()) ids.push(id.trim());
+		}
+		if (ids.length === 0) {
+			throw new OllamaCatalogFetchError("Ollama Cloud catalog returned no models");
+		}
+		return ids;
+	} catch (error) {
+		if (error instanceof OllamaCatalogFetchError) throw error;
+		if ((error as any)?.name === "AbortError") {
+			throw new OllamaCatalogFetchError("Ollama Cloud catalog request timed out");
+		}
+		throw new OllamaCatalogFetchError(
+			`Ollama Cloud catalog request failed: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	} finally {
+		clearTimeout(timer);
 	}
 }
 

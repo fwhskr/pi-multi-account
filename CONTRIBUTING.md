@@ -5,9 +5,11 @@ requests are welcome. All PRs are reviewed by the maintainer before merge.
 
 ## Ground rules
 
-- **Never include secrets.** This project only handles SHA-256 fingerprints of
-  credentials — never paste tokens, API keys, or `auth.json` contents into
-  issues, PRs, logs, or tests.
+- **Never include secrets.** The extension handles credentials for provider
+  authentication and usage requests and can keep a `0600` private OAuth recovery
+  sidecar while publishing loopback proxies. Credential values never enter
+  rotation state or logs; only SHA-256 fingerprints are persisted there. Never
+  paste tokens, API keys, or `auth.json` contents into issues, PRs, logs, or tests.
 - Keep each PR focused on a single concern.
 - Discuss large or breaking changes in an issue first.
 
@@ -40,7 +42,20 @@ CI runs the same checks on every pull request; they must pass before review.
 
 ## Releasing (maintainer only)
 
-1. Bump `version` in `package.json` and update `CHANGELOG.md`.
-2. `npm run check && npm publish`.
-3. Tag and push: `git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z`.
-4. Create the GitHub release for the tag.
+Publishing runs on GitHub Actions through npm **trusted publishing** (OIDC). There is no
+npm token anywhere, and `npm publish` is never run from a laptop — the workflow refuses to
+publish unless it is checked out on the tag matching `package.json`.
+
+1. Bump `version` in **both** `package.json` and `const VERSION` in `index.ts` — they must
+   match — and add the `CHANGELOG.md` entry.
+2. Land the change on `main` via PR (CI must be green).
+3. Tag and push the tag:
+   `git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z`
+4. Dry run first — this exercises the whole pipeline without uploading:
+   `gh workflow run publish.yml --ref vX.Y.Z -f dist_tag=latest -f dry_run=true`
+5. When that is green, publish for real:
+   `gh workflow run publish.yml --ref vX.Y.Z -f dist_tag=latest -f dry_run=false`
+6. Create the GitHub release for the tag.
+
+`--ref` must be the **tag**, not a branch: the workflow asserts `GITHUB_REF_TYPE=tag` and
+`GITHUB_REF_NAME=v<version>`, so dispatching from `main` fails that guard by design.

@@ -1,48 +1,51 @@
 name: Claude Code version check
 
-# Keeps CLAUDE_CODE_VERSION (used for the Anthropic OAuth billing header) in sync
-# with the latest Claude Code release, so nobody has to track it by hand. When it
-# drifts, this opens a PR bumping the constant — review and merge, then cut a release.
-
+# Protected main requires reviewed, tested PRs, and Actions cannot create PRs here.
+# Keep one actionable drift issue instead of attempting a forbidden direct push
+# or opening a new duplicate every week. The maintainer batches the bump into a release.
 on:
   schedule:
-    - cron: "0 9 * * 1" # weekly, Mondays 09:00 UTC
+    - cron: "0 9 * * 1"
   workflow_dispatch: {}
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
+  issues: write
+
+concurrency:
+  group: claude-code-version-check
+  cancel-in-progress: false
 
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Open PR if CLAUDE_CODE_VERSION drifted
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Report version drift without bypassing branch protection
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
         run: |
           set -euo pipefail
           latest="$(npm view @anthropic-ai/claude-code version)"
           current="$(grep -oE 'CLAUDE_CODE_VERSION = "[^"]+"' index.ts | sed -E 's/.*"([^"]+)".*/\1/')"
-          echo "latest=$latest current=$current"
+          test -n "$current"
+          printf '%s' "$latest" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'
           if [ "$latest" = "$current" ]; then
-            echo "Up to date — nothing to do."
+            echo "Up to date: $current"
             exit 0
           fi
-          branch="chore/claude-code-version-$latest"
-          if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
-            echo "Branch $branch already exists — PR likely open."
-            exit 0
+          title="Claude Code billing header version drift"
+          body="The weekly check found CLAUDE_CODE_VERSION=$current while npm reports $latest. Update index.ts in a reviewed PR and run npm run release:check. This tracker is updated in place; protected main is never pushed directly."
+          existing="$(gh issue list --state open --limit 100 --json number,title --jq '.[] | select(.title == "Claude Code billing header version drift") | .number' | head -n 1)"
+          if [ -n "$existing" ]; then
+            gh issue edit "$existing" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
           fi
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git checkout -b "$branch"
-          sed -i -E "s/CLAUDE_CODE_VERSION = \"[^\"]+\"/CLAUDE_CODE_VERSION = \"$latest\"/" index.ts
-          git add index.ts
-          git commit -m "chore: bump CLAUDE_CODE_VERSION to $latest"
-          git push origin "$branch"
-          gh pr create \
-            --base main --head "$branch" \
-            --title "Bump CLAUDE_CODE_VERSION to $latest" \
-            --body "Automated check: Claude Code released \`$latest\` (current constant: \`$current\`). This keeps the Anthropic OAuth billing header in sync so requests keep being accepted/counted correctly. Review, merge, then publish a new release."
