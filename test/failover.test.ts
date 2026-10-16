@@ -3350,12 +3350,18 @@ test("all-limited recovery polls provider availability even when the footer is h
 		},
 	});
 	try {
+		const refusalStartedAt = Date.now();
 		await finishError(t, "openai-codex", "gpt-5.5", "429 rate limit");
 		assert.ok(t.readState().pendingFrom, "a long estimated cooldown must leave a live wake");
 		assert.equal(t.rec.continueCalls.length, 0, "allowed metadata cannot skip the real refusal's backoff");
-		await wait(1250);
+		// The recheck is armed by a real timer at the 1000ms retry fence. A blind 250ms margin raced
+		// that timer on a loaded runner, so wait on the state (bounded) instead of a fixed sleep.
+		const deadline = Date.now() + 10_000;
+		while (t.rec.continueCalls.length === 0 && Date.now() < deadline) await wait(10);
+		const resumedAfterMs = Date.now() - refusalStartedAt;
 		assert.ok(probes > 0, "quota recovery must probe independently of footer visibility");
 		assert.equal(t.rec.continueCalls.length, 1, "after the bounded retry fence expires, allowed metadata permits one recheck");
+		assert.ok(resumedAfterMs >= 1000, `the recheck must not precede the 1000ms retry fence (resumed after ${resumedAfterMs}ms)`);
 	} finally {
 		globalThis.fetch = originalFetch;
 		await t.fire("session_shutdown");
