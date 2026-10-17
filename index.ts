@@ -53,6 +53,8 @@ import { getModel as getHostModel } from "@earendil-works/pi-ai/compat";
 import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import * as PiHost from "@earendil-works/pi-coding-agent";
+import { withBrowserLoginStatus } from "./subscription-provider.ts";
 import {
 	CURSOR_BASE,
 	CURSOR_PROXY_PLACEHOLDER_KEY,
@@ -616,6 +618,8 @@ const STATE_PATH = join(AGENT_DIR, "provider-failover-state.json");
 const AUTH_PATH = join(AGENT_DIR, "auth.json");
 const PROXY_OAUTH_PATH = join(AGENT_DIR, "pi-multi-account-proxy-oauth.json");
 const MODELS_CONFIG_PATH = join(AGENT_DIR, "models.json");
+const GENERATED_PROVIDER_CONFIG = (PiHost as any).ModelRuntime?.generatedProviderConfig === true;
+const MODELS_PUBLICATION_PATH = join(AGENT_DIR, GENERATED_PROVIDER_CONFIG ? "models.generated.json" : "models.json");
 const SETTINGS_PATH = join(AGENT_DIR, "settings.json");
 
 const PI_PACKAGE_NAME = "@earendil-works/pi-coding-agent";
@@ -809,11 +813,10 @@ function slotsAsAChildSeesThem(
 	slotIds: readonly string[],
 	auth: Record<string, { type?: string }>,
 ): ChildUsability[] {
-	const read = readPublishedJson(MODELS_CONFIG_PATH);
-	const published =
-		read.present && !read.unreadable && typeof (read.value as any)?.providers === "object"
-			? ((read.value as any).providers as Record<string, any>)
-			: {};
+	const read = readPublishedJson(MODELS_PUBLICATION_PATH);
+	const value = read.value as { providers?: Record<string, { apiKey?: unknown; baseUrl?: unknown }> } | undefined;
+	const published = read.present && !read.unreadable && value?.providers && typeof value.providers === "object"
+		? value.providers : {};
 	return slotIds.map((slotId) => {
 		const entry = published[slotId];
 		const credentialType = auth[slotId]?.type;
@@ -945,11 +948,11 @@ function nativeModelEntries(models: unknown[]): NativeModelEntry[] {
  * Failover state lives in provider-failover-state.json, our own file.
  * Merge-only: existing user entries and unrelated keys are preserved verbatim.
  */
-function provisionNativeSlot(provider: string, entry: NativeProviderEntry): void {
+export function provisionNativeSlot(provider: string, entry: NativeProviderEntry): void {
 	try {
 		const models = nativeModelEntries(entry.models);
-		const raw = existsSync(MODELS_CONFIG_PATH)
-			? readFileSync(MODELS_CONFIG_PATH, "utf8")
+		const raw = existsSync(MODELS_PUBLICATION_PATH)
+			? readFileSync(MODELS_PUBLICATION_PATH, "utf8")
 			: "{}";
 		const parsed = JSON.parse(raw);
 		const providers =
@@ -957,10 +960,12 @@ function provisionNativeSlot(provider: string, entry: NativeProviderEntry): void
 				? parsed.providers
 				: {};
 		const existing = providers[provider];
+		const catalogProvider = GENERATED_PROVIDER_CONFIG && /^(anthropic|openai|openai-codex)(?:-account-\d+)?$/.test(provider)
+			? provider.replace(/-account-\d+$/, "") : undefined;
 		const normalized: Record<string, unknown> = {
 			api: entry.api,
 			baseUrl: entry.baseUrl,
-			models,
+			...(catalogProvider ? (provider === catalogProvider ? {} : { catalogProvider }) : { models }),
 		};
 		if (entry.apiKey) normalized.apiKey = entry.apiKey;
 		if (entry.compat) normalized.compat = entry.compat;
@@ -970,7 +975,8 @@ function provisionNativeSlot(provider: string, entry: NativeProviderEntry): void
 			existing?.baseUrl === normalized.baseUrl &&
 			existing?.api === normalized.api &&
 			existing?.apiKey === normalized.apiKey &&
-			JSON.stringify(existing?.models ?? []) === JSON.stringify(models)
+			JSON.stringify(existing?.models) === JSON.stringify(normalized.models) &&
+			existing?.catalogProvider === normalized.catalogProvider
 		) {
 			return; // already provisioned — do not touch the file
 		}
@@ -978,13 +984,12 @@ function provisionNativeSlot(provider: string, entry: NativeProviderEntry): void
 			...parsed,
 			providers: { ...providers, [provider]: normalized },
 		};
-		const tmp = `${MODELS_CONFIG_PATH}.multi-account.tmp`;
-		writeFileSync(tmp, `${JSON.stringify(next, null, 2)}
-`, {
+		const tmp = `${MODELS_PUBLICATION_PATH}.multi-account.tmp`;
+		writeFileSync(tmp, `${JSON.stringify(next, null, 2)}\n`, {
 			encoding: "utf8",
 			mode: 0o600,
 		});
-		renameSync(tmp, MODELS_CONFIG_PATH);
+		renameSync(tmp, MODELS_PUBLICATION_PATH);
 	} catch {
 		/* models.json locked/corrupt — the extension registry still works */
 	}
@@ -993,8 +998,8 @@ function provisionNativeSlot(provider: string, entry: NativeProviderEntry): void
 /** Remove loopback publications we wrote, never a user's own models.json entry. */
 function unprovisionOwnLoopbacks(slotIds?: readonly string[]): void {
 	try {
-		if (!existsSync(MODELS_CONFIG_PATH)) return;
-		const parsed = JSON.parse(readFileSync(MODELS_CONFIG_PATH, "utf8"));
+		if (!existsSync(MODELS_PUBLICATION_PATH)) return;
+		const parsed = JSON.parse(readFileSync(MODELS_PUBLICATION_PATH, "utf8"));
 		const providers =
 			typeof parsed?.providers === "object" && parsed.providers !== null
 				? parsed.providers
@@ -1003,12 +1008,12 @@ function unprovisionOwnLoopbacks(slotIds?: readonly string[]): void {
 		const nextProviders = dropOwnLoopbackPublications(providers, slotIds);
 		if (JSON.stringify(nextProviders) === JSON.stringify(providers)) return;
 		const next = { ...parsed, providers: nextProviders };
-		const tmp = `${MODELS_CONFIG_PATH}.multi-account.tmp`;
+		const tmp = `${MODELS_PUBLICATION_PATH}.multi-account.tmp`;
 		writeFileSync(tmp, `${JSON.stringify(next, null, 2)}\n`, {
 			encoding: "utf8",
 			mode: 0o600,
 		});
-		renameSync(tmp, MODELS_CONFIG_PATH);
+		renameSync(tmp, MODELS_PUBLICATION_PATH);
 	} catch {
 		/* leaving a stale loopback is worse than a failed write; next publish retries */
 	}
@@ -2209,8 +2214,8 @@ export async function persistRefreshedCredentials(
 	provider: string,
 	credential: Record<string, unknown>,
 	io?: {
-		read?: () => Record<string, any>;
-		write?: (data: Record<string, any>) => void;
+		read?: () => Record<string, AuthEntry>;
+		write?: (data: Record<string, AuthEntry>) => void;
 	},
 ): Promise<boolean> {
 	// Even legacy/set-only hosts must never unhide a numbered slot while saving a refresh.
@@ -2627,7 +2632,7 @@ function parseTarget(
 function normalizeExcludedTargets(value: unknown, modelTargets: boolean): string[] {
 	const targets = stringArray(value).flatMap((target) => {
 		const parsed = parseTarget(target);
-		if (!parsed || /\s/.test(target) || !!parsed.modelId !== modelTargets) return [];
+		if (!parsed || /\s/.test(target) || Boolean(parsed.modelId) !== modelTargets) return [];
 		return [parsed.modelId ? `${parsed.provider}/${parsed.modelId}` : parsed.provider];
 	});
 	return [...new Set(targets)];
@@ -2990,8 +2995,32 @@ function registerAnthropicSlot(
 	id: string,
 	modelIds: string[] = DEFAULT_ANTHROPIC_MODELS,
 	baseUrl = "https://api.anthropic.com",
+	liveCatalog?: () => readonly any[],
 ) {
 	if (id === ANTHROPIC_BASE) return; // base provider: oauth + shaping registered in piMultiAccount()
+	if (GENERATED_PROVIDER_CONFIG) {
+		const native = builtinProviders().find(provider => provider.id === ANTHROPIC_BASE);
+		if (native?.auth.oauth) {
+			const nativeOAuth = native.auth.oauth;
+			const catalog = () => {
+				const current = liveCatalog?.();
+				return current?.length ? current : native.getModels();
+			};
+			const clone = {
+				...native, id, name: `Claude Pro/Max (${id})`, baseUrl,
+				streamSimple: anthropicPayloadStream,
+				getModels: () => catalog().map(model => ({ ...model, provider: id, baseUrl })),
+				getAllModels: () => catalog().map(model => ({ ...model, provider: id, baseUrl })),
+				auth: { ...native.auth, oauth: { ...nativeOAuth,
+					async login(interaction: any, options: any) {
+						return rejectDuplicateLogin(id, await nativeOAuth.login(interaction, options));
+					},
+				} },
+			};
+			(pi.registerProvider as any)(withBrowserLoginStatus(clone, id, readAuthFile));
+			return;
+		}
+	}
 	const models = modelIds.map((m) => anthropicModelDef(m, id));
 	pi.registerProvider(id, {
 		name: `Claude Pro/Max (${id})`,
@@ -3766,10 +3795,12 @@ function normalizeSystemBlock(block: unknown): ShapeTextBlock {
 	return { type: "text", text: "" };
 }
 
-function prependBillingHeader(
-	system: unknown,
+type BillingSystem<T> = T | ShapeTextBlock[];
+
+function prependBillingHeader<T>(
+	system: T,
 	messages: ShapeMessageParam[],
-): unknown {
+): BillingSystem<T> {
 	const billingHeader = buildBillingHeaderValue(messages);
 	if (!billingHeader) return system;
 	const systemBlocks = Array.isArray(system)
@@ -3867,7 +3898,9 @@ function shapeSystemBlocks(blocks: ShapeTextBlock[]): ShapeTextBlock[] {
 }
 
 /** before_provider_request shaper: makes Claude Pro/Max OAuth requests acceptable. */
-function shapeAnthropicOAuthPayload(payload: unknown): unknown {
+type ShapedAnthropicPayload<T> = T | Record<string, unknown>;
+
+function shapeAnthropicOAuthPayload<T>(payload: T): ShapedAnthropicPayload<T> {
 	if (!isAnthropicMessagesPayload(payload)) return payload;
 	const messages = payload.messages as ShapeMessageParam[];
 	if (!isOAuthAnthropicPayload(payload)) return payload; // API-key / non-OAuth → untouched
@@ -4045,6 +4078,12 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	const openaiSlotSignatures = new Map<string, string>();
 	let openaiModelOrder: string[] = [];
 	let openaiHostContext: any;
+	let anthropicHostContext: any;
+	function anthropicCatalogFromHost(ctx?: any): any[] {
+		anthropicHostContext = ctx ?? anthropicHostContext;
+		return (anthropicHostContext?.modelRegistry?.getAll?.() ?? []).filter((model: any) =>
+			model.provider === ANTHROPIC_BASE && (!model.type || model.type === "chat"));
+	}
 	function openaiCatalogFromHost(ctx?: any): any[] {
 		openaiHostContext = ctx ?? openaiHostContext;
 		const host = (ctx?.modelRegistry?.getAll?.() ?? []).filter((model: any) =>
@@ -4063,7 +4102,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		openaiModelOrder = [...(models ?? nativeOpenAI.getModels())].sort(compareCodexModelStrength).map((model: any) => String(model.id));
 		// The object overload is used only after the native OAuth capability check.
 		// Older host declarations expose only the legacy two-argument overload.
-		(pi.registerProvider as any)(clone);
+		(pi.registerProvider as any)(withBrowserLoginStatus(clone, id, readAuthFile));
 	}
 	function registerSlotModels(provider: string, models: any[]) {
 		if (/^openai-account-\d+$/.test(provider) && nativeOpenAI) {
@@ -4951,18 +4990,17 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				return next;
 			});
 			// Adopt the merged snapshot so a later local write cannot undo a concurrent session.
-			for (const [map, values] of [
-				[exhaustedUntilByProvider, next.exhaustedUntilByProvider],
-				[exhaustedUntilByModel, next.exhaustedUntilByModel],
-				[invalidatedByProvider, next.invalidatedByProvider],
-				[usageUntrustedUntilByProvider, next.usageUntrustedUntilByProvider],
-				[limitRefusalByProvider, next.limitRefusalByProvider],
-				[usageByProvider, next.usageByProvider],
-				[codexModelCatalogByProvider, next.codexModelCatalogByProvider],
-			] as Array<[Map<string, any>, Record<string, any> | undefined]>) {
+			const adoptMap = <T>(map: Map<string, T>, values: Record<string, T> | undefined): void => {
 				map.clear();
 				for (const [key, value] of Object.entries(values ?? {})) map.set(key, value);
-			}
+			};
+			adoptMap(exhaustedUntilByProvider, next.exhaustedUntilByProvider);
+			adoptMap(exhaustedUntilByModel, next.exhaustedUntilByModel);
+			adoptMap(invalidatedByProvider, next.invalidatedByProvider);
+			adoptMap(usageUntrustedUntilByProvider, next.usageUntrustedUntilByProvider);
+			adoptMap(limitRefusalByProvider, next.limitRefusalByProvider);
+			adoptMap(usageByProvider, next.usageByProvider);
+			adoptMap(codexModelCatalogByProvider, next.codexModelCatalogByProvider);
 			lastSavedState = structuredClone(next);
 		} catch {
 			logEvent("state_write_deferred", { reason: "storage_unavailable_or_busy" });
@@ -5337,7 +5375,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		} catch {
 			hostIds = [];
 		}
-		const ranked = rankAnthropicModelIds([
+		const ranked = rankAnthropicModelIds(GENERATED_PROVIDER_CONFIG && hostIds.length ? hostIds : [
 			...hostIds,
 			...DEFAULT_ANTHROPIC_MODELS,
 		]);
@@ -5354,6 +5392,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				provider,
 				ranked,
 				numberedAnthropicBaseUrl(provider),
+				() => anthropicCatalogFromHost(ctx),
 			);
 		}
 	}
@@ -6697,7 +6736,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		waitForCatalogMs = 0,
 	) {
 		if (!config.includeCursor) return;
-		if (!explicit && !isCursorProviderInstalled()) return;
+		if (!explicit && (!isCursorProviderInstalled() || !Object.entries(auth).some(([id, entry]) =>
+			isCursorProviderId(id) && entry.type === "oauth" && isEntryUsable(entry)))) return;
 		const slotIds = [
 			...new Set([
 				...Object.keys(auth).filter(
@@ -6780,7 +6820,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// entry — cursor used to conjure a spare `cursor-account-2` out of nothing, so /login
 		// offered a slot no provider could serve. Only offer cursor slots once the provider
 		// is actually on disk.
-		const cursorAvailable = config.includeCursor && isCursorProviderInstalled();
+		const cursorAvailable = config.includeCursor && isCursorProviderInstalled() &&
+			Object.entries(auth).some(([id, entry]) => isCursorProviderId(id) && entry.type === "oauth" && isEntryUsable(entry));
 		const families: ProviderFamily[] = [
 			"anthropic",
 			"openai-codex",
@@ -6845,6 +6886,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 						id,
 						DEFAULT_ANTHROPIC_MODELS,
 						numberedAnthropicBaseUrl(id),
+						() => anthropicCatalogFromHost(ctx),
 					);
 				} else if (family === "openai-codex") {
 					const cached = codexModelCatalogByProvider.get(id)?.models;
@@ -7999,15 +8041,6 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		}
 	}
 
-	// A context-size error (vs. a quota/auth/transient error). Detected against the intrinsic
-	// overflow vocabulary so a user override of ignoreErrorPatterns cannot accidentally make us
-	// treat "input is too long" as a rotate-able limit (rotating just hands the SAME oversized
-	// context to the next account, which overflows again).
-	function isContextOverflowError(text: string): boolean {
-		if (!text.trim()) return false;
-		return patternMatch(text, DEFAULT_IGNORE_PATTERNS);
-	}
-
 	// ----- forward-progress watchdog ---------------------------------------
 	// A resumed turn (one WE started via continueAgent after a switch) must keep showing
 	// activity. Any stream token / tool event / provider response calls noteResumeProgress and
@@ -8280,20 +8313,6 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 					model.id === ctx.model?.id
 				),
 		);
-	}
-
-	function cursorFamilyProviderIds(ctx: any, extra?: string): Set<string> {
-		const ids = new Set<string>();
-		if (extra && isCursorProviderId(extra)) ids.add(extra);
-		for (const model of ctx?.modelRegistry?.getAll?.() ?? []) {
-			if (
-				typeof model?.provider === "string" &&
-				isCursorProviderId(model.provider)
-			) {
-				ids.add(model.provider);
-			}
-		}
-		return ids;
 	}
 
 	async function runHealthyCompaction(
@@ -9568,30 +9587,6 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	}
 
 	// ----- error classification --------------------------------------------
-
-	function isAuthError(text: string) {
-		if (!text.trim()) return false;
-		if (patternMatch(text, config.ignoreErrorPatterns)) return false;
-		return patternMatch(text, config.authErrorPatterns);
-	}
-
-	function isLimitError(text: string) {
-		if (!text.trim()) return false;
-		if (patternMatch(text, config.ignoreErrorPatterns)) return false;
-		return patternMatch(text, config.limitErrorPatterns);
-	}
-
-	function isTransientError(text: string) {
-		if (!text.trim()) return false;
-		if (patternMatch(text, config.ignoreErrorPatterns)) return false;
-		return patternMatch(text, config.transientErrorPatterns);
-	}
-
-	function isModelError(text: string) {
-		if (!text.trim()) return false;
-		if (patternMatch(text, config.ignoreErrorPatterns)) return false;
-		return patternMatch(text, config.modelErrorPatterns);
-	}
 
 	function assistantErrorText(message: any) {
 		const parts: string[] = [];
@@ -11699,7 +11694,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				registerCodexSlot(pi, id, config.autoDiscoverModels && cached?.length
 					? (cached as Array<Record<string, unknown>>) : undefined, baseUrl);
 			} else if (family === "anthropic") {
-				registerAnthropicSlot(pi, id, DEFAULT_ANTHROPIC_MODELS, baseUrl);
+				registerAnthropicSlot(pi, id, DEFAULT_ANTHROPIC_MODELS, baseUrl, () => anthropicCatalogFromHost(slotProxyContext));
 			} else if (family === "openai") {
 				registerOpenAISlot(id, `${baseUrl}/v1`, openaiSlotModels.get(id));
 			}
@@ -12422,8 +12417,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	}
 
 	function preflightHostCapabilities(ctx: any) {
-		const has = (name: string) =>
-			typeof (pi as unknown as Record<string, unknown>)[name] === "function";
+		const has = (name: string) => typeof Reflect.get(pi, name) === "function";
 		const caps = {
 			setModel: has("setModel"), // switch accounts at all
 			registerProvider: has("registerProvider"), // register extra account slots
