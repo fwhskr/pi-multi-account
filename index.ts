@@ -3002,15 +3002,16 @@ function registerAnthropicSlot(
 		const native = builtinProviders().find(provider => provider.id === ANTHROPIC_BASE);
 		if (native?.auth.oauth) {
 			const nativeOAuth = native.auth.oauth;
-			const catalog = () => {
-				const current = liveCatalog?.();
-				return current?.length ? current : native.getModels();
-			};
+			// Resolve the host snapshot before registering the clone. Provider getters
+			// run inside registry enumeration: calling getAll() from one recursively
+			// enumerates this very clone and freezes the startup event loop.
+			const current = liveCatalog?.();
+			const catalogModels = [...(current?.length ? current : native.getModels())];
 			const clone = {
 				...native, id, name: `Claude Pro/Max (${id})`, baseUrl,
 				streamSimple: anthropicPayloadStream,
-				getModels: () => catalog().map(model => ({ ...model, provider: id, baseUrl })),
-				getAllModels: () => catalog().map(model => ({ ...model, provider: id, baseUrl })),
+				getModels: () => catalogModels.map(model => ({ ...model, provider: id, baseUrl })),
+				getAllModels: () => catalogModels.map(model => ({ ...model, provider: id, baseUrl })),
 				auth: { ...native.auth, oauth: { ...nativeOAuth,
 					async login(interaction: any, options: any) {
 						return rejectDuplicateLogin(id, await nativeOAuth.login(interaction, options));
